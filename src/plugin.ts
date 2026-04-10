@@ -119,8 +119,8 @@ ${AUDIO_TAG_EXAMPLES}
 The audio plays in the background and control returns immediately.
 
 USAGE GUIDANCE:
-- Speak naturally — match length to the complexity of the response
-- Short for simple confirmations, longer for explanations or nuanced thoughts
+- Speak naturally — 1-2 sentences is the routine target, 3-4 is fine when clarity needs it
+- Don't pad. Don't muzzle. Match the moment.
 - Avoid reading out code, file paths, JSON, or long technical lists — use written text for those
 - Pair with written text when precision matters (commands, paths, structured data)
 - Examples:
