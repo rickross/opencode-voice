@@ -1,6 +1,6 @@
 import { tool, type Plugin } from "@opencode-ai/plugin";
-import { readFileSync, writeFileSync, unlinkSync, existsSync } from "fs";
-import { tmpdir, homedir } from "os";
+import { readFileSync, existsSync } from "fs";
+import { homedir } from "os";
 import { join } from "path";
 import { spawn } from "child_process";
 
@@ -60,15 +60,28 @@ function loadApiKey(apiKeyPath: string): string {
   }
 }
 
-function playAudio(filePath: string, volume: number): void {
-  const child = spawn("afplay", ["-v", String(volume), filePath], {
+function streamAudio(stream: ReadableStream, volume: number): void {
+  const child = spawn("afplay", ["-v", String(volume), "-"], {
     detached: true,
-    stdio: "ignore",
+    stdio: ["pipe", "ignore", "ignore"],
   });
   child.unref();
-  child.on("exit", () => {
-    try { unlinkSync(filePath); } catch { /* ignore */ }
-  });
+
+  const reader = stream.getReader();
+  const writableStdin = child.stdin!;
+
+  async function pump() {
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) { writableStdin.end(); break; }
+        writableStdin.write(value);
+      }
+    } catch {
+      writableStdin.end();
+    }
+  }
+  pump();
 }
 
 const AUDIO_TAG_EXAMPLES = `
@@ -183,11 +196,7 @@ USAGE GUIDANCE:
         throw new Error(`ElevenLabs API error (${response.status}): ${errorText}`);
       }
 
-      const audioBuffer = await response.arrayBuffer();
-      const tempFile = join(tmpdir(), `opencode-voice-${Date.now()}.mp3`);
-      writeFileSync(tempFile, Buffer.from(audioBuffer));
-
-      playAudio(tempFile, volume);
+      streamAudio(response.body!, volume);
 
       const preview = text.length > 80 ? text.substring(0, 80) + "..." : text;
       return `<speak_started>
