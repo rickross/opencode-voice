@@ -1,6 +1,6 @@
 import { tool, type Plugin } from "@opencode-ai/plugin";
-import { readFileSync, existsSync, writeFileSync, unlinkSync } from "fs";
-import { homedir, tmpdir } from "os";
+import { readFileSync, existsSync } from "fs";
+import { homedir } from "os";
 import { join } from "path";
 import { spawn } from "child_process";
 
@@ -60,27 +60,29 @@ function loadApiKey(apiKeyPath: string): string {
   }
 }
 
-function playAudio(filePath: string, volume: number): void {
-  const child = spawn("afplay", ["-v", String(volume), filePath], {
-    detached: true,
-    stdio: "ignore",
-  });
+function streamAudio(stream: ReadableStream, volume: number): void {
+  // sox `play` reads mp3 from stdin — lightweight, no GUI
+  const child = spawn(
+    "play",
+    ["-v", String(volume), "-t", "mp3", "-"],
+    { detached: true, stdio: ["pipe", "ignore", "ignore"] }
+  );
   child.unref();
-  child.on("exit", () => { try { unlinkSync(filePath); } catch { /* ignore */ } });
-}
 
-async function streamToFileAndPlay(stream: ReadableStream, volume: number): Promise<void> {
-  const tempFile = join(tmpdir(), `opencode-voice-${Date.now()}.mp3`);
-  const chunks: Uint8Array[] = [];
   const reader = stream.getReader();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-  }
-  const buffer = Buffer.concat(chunks);
-  writeFileSync(tempFile, buffer);
-  playAudio(tempFile, volume);
+  const stdin = child.stdin!;
+
+  (async () => {
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) { stdin.end(); break; }
+        stdin.write(value);
+      }
+    } catch {
+      stdin.end();
+    }
+  })();
 }
 
 const AUDIO_TAG_EXAMPLES = `
@@ -195,7 +197,7 @@ USAGE GUIDANCE:
         throw new Error(`ElevenLabs API error (${response.status}): ${errorText}`);
       }
 
-      await streamToFileAndPlay(response.body!, volume);
+      streamAudio(response.body!, volume);
 
       const preview = text.length > 80 ? text.substring(0, 80) + "..." : text;
       return `<speak_started>
