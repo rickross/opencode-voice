@@ -119,14 +119,15 @@ ${AUDIO_TAG_EXAMPLES}
 The audio plays in the background and control returns immediately.
 
 USAGE GUIDANCE:
-- Use in SHORT BURSTS to notify the user of important state changes
-- Good for: task completion, errors requiring attention, questions needing user input
-- Keep messages concise (1-2 sentences) - don't read entire responses aloud
-- Examples of when to use:
+- Speak naturally — match length to the complexity of the response
+- Short for simple confirmations, longer for explanations or nuanced thoughts
+- Avoid reading out code, file paths, JSON, or long technical lists — use written text for those
+- Pair with written text when precision matters (commands, paths, structured data)
+- Examples:
   * "[excited] Done! The build succeeded."
-  * "[curious] I have a question - should I proceed with the refactor?"
+  * "[curious] I have a question — should I proceed with the refactor?"
   * "[sighs] I found 3 errors we need to fix."
-  * "[whispers] Heads up - I'm about to make a breaking change."`,
+  * "[warmly] That's a good instinct. Here's why it works..."`,
 
     args: {
       text: tool.schema
