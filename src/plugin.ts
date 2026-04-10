@@ -170,7 +170,7 @@ USAGE GUIDANCE:
       const apiKey = loadApiKey(config.apiKeyPath);
 
       const response = await fetch(
-        `https://api.elevenlabs.io/v1/text-to-speech/${config.voiceId}?output_format=mp3_44100_128`,
+        `https://api.elevenlabs.io/v1/text-to-speech/${config.voiceId}/stream?output_format=mp3_44100_128`,
         {
           method: "POST",
           headers: {
