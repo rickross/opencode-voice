@@ -1,6 +1,6 @@
 import { tool, type Plugin } from "@opencode-ai/plugin";
-import { readFileSync, existsSync } from "fs";
-import { homedir } from "os";
+import { readFileSync, existsSync, writeFileSync, unlinkSync } from "fs";
+import { homedir, tmpdir } from "os";
 import { join } from "path";
 import { spawn } from "child_process";
 
@@ -60,28 +60,27 @@ function loadApiKey(apiKeyPath: string): string {
   }
 }
 
-function streamAudio(stream: ReadableStream, volume: number): void {
-  const child = spawn("afplay", ["-v", String(volume), "-"], {
+function playAudio(filePath: string, volume: number): void {
+  const child = spawn("afplay", ["-v", String(volume), filePath], {
     detached: true,
-    stdio: ["pipe", "ignore", "ignore"],
+    stdio: "ignore",
   });
   child.unref();
+  child.on("exit", () => { try { unlinkSync(filePath); } catch { /* ignore */ } });
+}
 
+async function streamToFileAndPlay(stream: ReadableStream, volume: number): Promise<void> {
+  const tempFile = join(tmpdir(), `opencode-voice-${Date.now()}.mp3`);
+  const chunks: Uint8Array[] = [];
   const reader = stream.getReader();
-  const writableStdin = child.stdin!;
-
-  async function pump() {
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) { writableStdin.end(); break; }
-        writableStdin.write(value);
-      }
-    } catch {
-      writableStdin.end();
-    }
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
   }
-  pump();
+  const buffer = Buffer.concat(chunks);
+  writeFileSync(tempFile, buffer);
+  playAudio(tempFile, volume);
 }
 
 const AUDIO_TAG_EXAMPLES = `
@@ -196,7 +195,7 @@ USAGE GUIDANCE:
         throw new Error(`ElevenLabs API error (${response.status}): ${errorText}`);
       }
 
-      streamAudio(response.body!, volume);
+      await streamToFileAndPlay(response.body!, volume);
 
       const preview = text.length > 80 ? text.substring(0, 80) + "..." : text;
       return `<speak_started>
