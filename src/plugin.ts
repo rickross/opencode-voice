@@ -15,6 +15,7 @@ const DEFAULT_API_KEY_PATH = join(
   homedir(),
   ".config/opencode/secrets/elevenlabs-key"
 );
+const DEFAULT_OMNIVOICE_ENDPOINT = "http://127.0.0.1:7345";
 const CONFIG_FILE = "voice.json";
 const STATE_FILE = "voice-state.json";
 
@@ -36,10 +37,28 @@ const STATE_FILE = "voice-state.json";
 export interface VoiceConfig {
   /** Which TTS backend to use. Defaults to "elevenlabs". */
   provider?: ProviderName;
+
+  // --- ElevenLabs fields ---
   voiceId?: string;
   modelId?: string;
   /** Path to file containing the ElevenLabs API key */
   apiKeyPath?: string;
+  stability?: number;
+  similarityBoost?: number;
+  style?: number;
+  useSpeakerBoost?: boolean;
+  preserveVoiceDefaults?: boolean;
+
+  // --- OmniVoice fields ---
+  /**
+   * OmniVoice daemon endpoint, e.g. "http://127.0.0.1:7345".
+   * Defaults to http://127.0.0.1:7345 when provider is "omnivoice".
+   */
+  omnivoiceEndpoint?: string;
+  /** Per-request timeout when calling the OmniVoice daemon (ms). */
+  omnivoiceTimeoutMs?: number;
+
+  // --- Shared ---
   enabled?: boolean | "on" | "off" | "default";
   /**
    * Speech mode:
@@ -47,11 +66,6 @@ export interface VoiceConfig {
    *   "all"              — speak everything except content wrapped in <no-speak>...</no-speak> tags
    */
   speakMode?: "tagged" | "all";
-  stability?: number;
-  similarityBoost?: number;
-  style?: number;
-  useSpeakerBoost?: boolean;
-  preserveVoiceDefaults?: boolean;
   speed?: number;
   volume?: number;
 }
@@ -141,32 +155,48 @@ export const VoicePlugin: Plugin = async (input, options) => {
   // Merge: defaults < agent voice.json < inline plugin options
   const config = {
     provider: (voiceOptions?.provider ?? agentConfig?.provider ?? DEFAULT_PROVIDER) as ProviderName,
+    // ElevenLabs config
     voiceId: voiceOptions?.voiceId ?? agentConfig?.voiceId ?? DEFAULT_VOICE_ID,
     modelId: voiceOptions?.modelId ?? agentConfig?.modelId ?? DEFAULT_MODEL_ID,
     apiKeyPath: voiceOptions?.apiKeyPath ?? agentConfig?.apiKeyPath ?? DEFAULT_API_KEY_PATH,
-    enabled: runtimeState?.enabled ?? resolveEnabled(configuredEnabled),
-    configuredEnabled,
-    speakMode: (runtimeState?.speakMode ?? voiceOptions?.speakMode ?? agentConfig?.speakMode ?? "tagged") as "tagged" | "all",
     stability: voiceOptions?.stability ?? agentConfig?.stability ?? 0.5,
     similarityBoost: voiceOptions?.similarityBoost ?? agentConfig?.similarityBoost ?? 0.75,
     style: voiceOptions?.style ?? agentConfig?.style,
     useSpeakerBoost: voiceOptions?.useSpeakerBoost ?? agentConfig?.useSpeakerBoost,
     preserveVoiceDefaults: voiceOptions?.preserveVoiceDefaults ?? agentConfig?.preserveVoiceDefaults ?? false,
+    // OmniVoice config
+    omnivoiceEndpoint: voiceOptions?.omnivoiceEndpoint ?? agentConfig?.omnivoiceEndpoint ?? DEFAULT_OMNIVOICE_ENDPOINT,
+    omnivoiceTimeoutMs: voiceOptions?.omnivoiceTimeoutMs ?? agentConfig?.omnivoiceTimeoutMs,
+    // Runtime / shared
+    enabled: runtimeState?.enabled ?? resolveEnabled(configuredEnabled),
+    configuredEnabled,
+    speakMode: (runtimeState?.speakMode ?? voiceOptions?.speakMode ?? agentConfig?.speakMode ?? "tagged") as "tagged" | "all",
     speed: voiceOptions?.speed ?? agentConfig?.speed ?? 1.0,
     volume: voiceOptions?.volume ?? agentConfig?.volume ?? 1.0,
   };
 
-  // Instantiate the provider once at plugin init.
-  const provider: TTSProvider = createProvider(config.provider, {
-    voiceId: config.voiceId,
-    modelId: config.modelId,
-    apiKeyPath: config.apiKeyPath,
-    stability: config.stability,
-    similarityBoost: config.similarityBoost,
-    style: config.style,
-    useSpeakerBoost: config.useSpeakerBoost,
-    preserveVoiceDefaults: config.preserveVoiceDefaults,
-  });
+  // Instantiate the provider once at plugin init based on which backend
+  // is selected. Each provider only sees the config it cares about.
+  function buildProvider(): TTSProvider {
+    if (config.provider === "omnivoice") {
+      return createProvider("omnivoice", {
+        endpoint: config.omnivoiceEndpoint,
+        timeoutMs: config.omnivoiceTimeoutMs,
+      });
+    }
+    return createProvider("elevenlabs", {
+      voiceId: config.voiceId,
+      modelId: config.modelId,
+      apiKeyPath: config.apiKeyPath,
+      stability: config.stability,
+      similarityBoost: config.similarityBoost,
+      style: config.style,
+      useSpeakerBoost: config.useSpeakerBoost,
+      preserveVoiceDefaults: config.preserveVoiceDefaults,
+    });
+  }
+
+  const provider: TTSProvider = buildProvider();
 
   /**
    * Internal helper that drives a request through the provider and returns

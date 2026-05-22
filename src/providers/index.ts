@@ -1,4 +1,5 @@
 import { createElevenLabsProvider } from "./elevenlabs.js";
+import { createOmniVoiceProvider } from "./omnivoice.js";
 import type { TTSProvider } from "./types.js";
 
 /**
@@ -18,8 +19,10 @@ export interface ProviderConfigs {
     useSpeakerBoost?: boolean;
     preserveVoiceDefaults?: boolean;
   };
-  // Future providers register their config shape here.
-  // omnivoice: { voiceClonePrompt: string; daemonSocket?: string; ... };
+  omnivoice: {
+    endpoint: string;
+    timeoutMs?: number;
+  };
 }
 
 export type ProviderName = keyof ProviderConfigs;
@@ -37,6 +40,9 @@ export function createProvider<P extends ProviderName>(
 ): TTSProvider {
   if (name === "elevenlabs") {
     return createElevenLabsProvider(config as ProviderConfigs["elevenlabs"]);
+  }
+  if (name === "omnivoice") {
+    return createOmniVoiceProvider(config as ProviderConfigs["omnivoice"]);
   }
   throw new Error(`Unknown TTS provider: ${String(name)}`);
 }
