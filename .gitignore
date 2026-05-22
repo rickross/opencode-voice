@@ -8,6 +8,10 @@ bun.lock
 dist/
 *.tsbuildinfo
 
+# Python runtime artifacts
+__pycache__/
+*.pyc
+
 # OS files
 .DS_Store
 Thumbs.db

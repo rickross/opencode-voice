@@ -4,7 +4,7 @@ A long-running local TTS server that hosts [OmniVoice](https://github.com/k2-fsa
 
 ## Why a daemon
 
-Loading OmniVoice (the model + the Whisper ASR + a voice cell) takes several seconds. Doing that on every utterance would kill the sub-second time-to-first-byte target. The daemon loads everything once at startup, then handles each request in roughly the model's per-utterance generation time (~3.7s for short utterances on M4 Max MPS with a cached voice cell, ahead of real-time).
+Loading OmniVoice (the model + the Whisper ASR + voice cells) takes several seconds. Doing that on every utterance would kill the sub-second time-to-first-byte target. The daemon loads everything once at startup, then handles each request in roughly the model's per-utterance generation time (~3.7s for short utterances on M4 Max MPS with a cached voice cell, ahead of real-time).
 
 ## Quick start
 
@@ -35,6 +35,14 @@ export OMNIVOICE_CELL_PATH=/path/to/my-voice.voiceclone.pt
 ~/.venv/bin/python daemon/omnivoice-daemon.py
 ```
 
+For multiple voices, pass named cells:
+
+```bash
+~/.venv/bin/python daemon/omnivoice-daemon.py \
+    --cells aurora=/Users/rick/horde/voices/cells/aurora.voiceclone.pt,solene=/Users/rick/horde/voices/cells/solene.voiceclone.pt \
+    --default-voice aurora
+```
+
 Default bind is `127.0.0.1:7345` (local-only). First startup takes ~10–15s to load the model and cell; subsequent requests are fast.
 
 ### 3. Verify health
@@ -62,7 +70,9 @@ In your agent's `voice.json`:
 {
   "provider": "omnivoice",
   "omnivoice": {
-    "endpoint": "http://127.0.0.1:7345"
+    "endpoint": "http://127.0.0.1:7345",
+    "voice": "aurora",
+    "agent": "aurora"
   }
 }
 ```
@@ -76,12 +86,17 @@ Request body:
 ```json
 {
   "text": "The text to synthesize.",
+  "voice": "aurora",
+  "priority": "normal",
+  "agent": "aurora",
   "speed": 1.0,
   "num_step": 32
 }
 ```
 
-`speed` and `num_step` are optional. Returns a WAV (`audio/wav`) response body.
+`voice`, `priority`, `agent`, `speed`, and `num_step` are optional. Omitted `voice` uses the daemon's configured `default_voice`; omitted `priority` is `normal`. Invalid voices return `404` with a deterministic error. Returns a WAV (`audio/wav`) response body.
+
+The daemon uses a single inference worker because one shared MPS-resident OmniVoice model must not run concurrent `generate()` calls. Jobs are FIFO within priority; `high` jobs sort before `normal` jobs but do not preempt an active generation.
 
 ### `GET /health`
 
@@ -93,12 +108,20 @@ Returns daemon status, configuration, and aggregate stats:
   "model_id": "k2-fsa/OmniVoice",
   "device": "mps",
   "dtype": "float16",
-  "cell_path": "/Users/rick/Solene/identity/lison.voiceclone.pt",
+  "voices": ["aurora", "solene"],
+  "default_voice": "aurora",
+  "cell_paths": {
+    "aurora": "/Users/rick/horde/voices/cells/aurora.voiceclone.pt",
+    "solene": "/Users/rick/horde/voices/cells/solene.voiceclone.pt"
+  },
   "sampling_rate": 24000,
   "startup_time_seconds": 12.4,
   "utterances_served": 17,
   "total_generate_seconds": 63.2,
-  "avg_generate_seconds": 3.72
+  "avg_generate_seconds": 3.72,
+  "queue_depth": 0,
+  "current_job": null,
+  "waiters": 0
 }
 ```
 
@@ -106,7 +129,9 @@ Returns daemon status, configuration, and aggregate stats:
 
 | Variable / arg | Default | Description |
 |---|---|---|
-| `--cell` / `OMNIVOICE_CELL_PATH` | (required) | Path to a `.voiceclone.pt` voice cell |
+| `--cell` / `OMNIVOICE_CELL_PATH` | (legacy single voice) | Path to a `.voiceclone.pt` voice cell |
+| `--cells` / `OMNIVOICE_CELLS` | (preferred) | Comma list of `voice=/path/to/cell.pt` entries |
+| `--default-voice` / `OMNIVOICE_DEFAULT_VOICE` | `default` | Voice used when `/speak` omits `voice` |
 | `--model-id` / `OMNIVOICE_MODEL_ID` | `k2-fsa/OmniVoice` | HuggingFace model id |
 | `--device` / `OMNIVOICE_DEVICE` | `mps` | `mps` (Apple Silicon), `cuda:0`, or `cpu` |
 | `--dtype` / `OMNIVOICE_DTYPE` | `float16` | `float16` or `float32` |
@@ -121,7 +146,8 @@ Returns daemon status, configuration, and aggregate stats:
 ```bash
 tmux new -s omnivoice -d \
   "~/.venv/bin/python /Volumes/Huddy/Projects/opencode-voice/daemon/omnivoice-daemon.py \
-   --cell /Users/rick/Solene/identity/lison.voiceclone.pt"
+   --cells aurora=/Users/rick/horde/voices/cells/aurora.voiceclone.pt,solene=/Users/rick/horde/voices/cells/solene.voiceclone.pt \
+   --default-voice aurora"
 ```
 
 Inspect with `tmux attach -t omnivoice`. Detach with `Ctrl-b d`.
@@ -144,8 +170,10 @@ Save as `~/Library/LaunchAgents/com.solene.omnivoice-daemon.plist`:
     </array>
     <key>EnvironmentVariables</key>
     <dict>
-        <key>OMNIVOICE_CELL_PATH</key>
-        <string>/Users/rick/Solene/identity/lison.voiceclone.pt</string>
+        <key>OMNIVOICE_CELLS</key>
+        <string>aurora=/Users/rick/horde/voices/cells/aurora.voiceclone.pt,solene=/Users/rick/horde/voices/cells/solene.voiceclone.pt</string>
+        <key>OMNIVOICE_DEFAULT_VOICE</key>
+        <string>aurora</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -173,7 +201,7 @@ launchctl unload ~/Library/LaunchAgents/com.solene.omnivoice-daemon.plist
 
 ## Notes
 
-- One daemon, one voice. Each voice (Solène's Lison, Aurora's whatever, etc.) needs its own daemon instance with its own cell. Use distinct ports.
+- One daemon can serve multiple voice cells through the `voice` selector while keeping a single OmniVoice model instance resident.
 - The daemon does **not** play audio itself. It returns WAV bytes; the `opencode-voice` plugin handles playback.
 - WAV (PCM_16) is returned; the plugin pipes it into `sox play`.
 - First call after startup is sometimes slightly slower than steady-state due to MPS warmup.

@@ -1,17 +1,19 @@
 """
 OmniVoice daemon — local TTS server for opencode-voice plugin.
 
-Loads OmniVoice (k2-fsa/OmniVoice) on MPS at startup, holds a cached
-VoiceClonePrompt in memory, and exposes a small HTTP API for the plugin
-to call. Designed to be long-running (launchd or tmux) so that the heavy
-model-load cost happens once, and per-utterance latency stays low.
+Loads OmniVoice (k2-fsa/OmniVoice) on MPS at startup, holds cached
+VoiceClonePrompt cells in memory, and exposes a small HTTP API for the
+plugin to call. Designed to be long-running (launchd or tmux) so that the
+heavy model-load cost happens once, and per-utterance latency stays low.
 
 Endpoints:
     POST /speak      — synthesize text, return WAV bytes
     GET  /health     — liveness + status info
 
 Configuration via environment variables (or CLI args):
-    OMNIVOICE_CELL_PATH   path to .voiceclone.pt file (required)
+    OMNIVOICE_CELL_PATH   legacy single-voice .voiceclone.pt path
+    OMNIVOICE_CELLS       comma list of voice=/path/to/cell.pt entries
+    OMNIVOICE_DEFAULT_VOICE default voice key for requests without voice
     OMNIVOICE_MODEL_ID    HuggingFace model id (default: k2-fsa/OmniVoice)
     OMNIVOICE_DEVICE      torch device (default: mps)
     OMNIVOICE_DTYPE       float16 / float32 (default: float16)
@@ -31,18 +33,20 @@ Or with explicit args:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import io
 import logging
 import os
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 import soundfile as sf
 import torch
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel, Field
 
@@ -56,6 +60,7 @@ DEFAULT_DEVICE = "mps"
 DEFAULT_DTYPE = "float16"
 DEFAULT_PORT = 7345
 DEFAULT_HOST = "127.0.0.1"
+DEFAULT_VOICE = "default"
 
 logger = logging.getLogger("omnivoice-daemon")
 
@@ -67,6 +72,15 @@ logger = logging.getLogger("omnivoice-daemon")
 
 class SpeakRequest(BaseModel):
     text: str = Field(..., min_length=1, description="Text to synthesize")
+    voice: Optional[str] = Field(
+        None, min_length=1, description="Voice key loaded by the daemon"
+    )
+    priority: str = Field(
+        "normal", pattern="^(normal|high)$", description="Queue priority hint"
+    )
+    agent: Optional[str] = Field(
+        None, min_length=1, description="Optional caller id for diagnostics"
+    )
     speed: Optional[float] = Field(
         None, ge=0.5, le=2.0, description="Optional speech rate multiplier"
     )
@@ -80,13 +94,25 @@ class SpeakRequest(BaseModel):
 # -----------------------------------------------------------------------------
 
 
+@dataclass(order=True)
+class SpeakJob:
+    priority_rank: int
+    sequence: int
+    request: SpeakRequest = field(compare=False)
+    voice: str = field(compare=False)
+    future: asyncio.Future[bytes] = field(compare=False)
+    enqueued_at: float = field(default_factory=time.time, compare=False)
+    started_at: Optional[float] = field(default=None, compare=False)
+
+
 class DaemonState:
-    """Holds the loaded OmniVoice model + cached VoiceClonePrompt."""
+    """Holds the loaded OmniVoice model + cached VoiceClonePrompt cells."""
 
     def __init__(self) -> None:
         self.model = None
-        self.voice_clone_prompt = None
-        self.cell_path: Optional[Path] = None
+        self.voice_clone_prompts: dict[str, object] = {}
+        self.cell_paths: dict[str, Path] = {}
+        self.default_voice: str = DEFAULT_VOICE
         self.model_id: str = DEFAULT_MODEL_ID
         self.device: str = DEFAULT_DEVICE
         self.dtype: str = DEFAULT_DTYPE
@@ -94,10 +120,15 @@ class DaemonState:
         self.startup_time: Optional[float] = None
         self.utterances_served: int = 0
         self.total_generate_seconds: float = 0.0
+        self.queue: asyncio.PriorityQueue[SpeakJob] = asyncio.PriorityQueue()
+        self.current_job: Optional[dict] = None
+        self._sequence: int = 0
+        self._worker_task: Optional[asyncio.Task] = None
 
     def load(
         self,
-        cell_path: Path,
+        cells: dict[str, Path],
+        default_voice: str,
         model_id: str = DEFAULT_MODEL_ID,
         device: str = DEFAULT_DEVICE,
         dtype: str = DEFAULT_DTYPE,
@@ -115,40 +146,55 @@ class DaemonState:
         t_model = time.time() - t_start
         logger.info("Model loaded in %.2fs", t_model)
 
-        logger.info("Loading voice cell from %s", cell_path)
-        t0 = time.time()
-        loaded = torch.load(cell_path, weights_only=False, map_location="cpu")
-        self.voice_clone_prompt = VoiceClonePrompt(
-            ref_audio_tokens=loaded["ref_audio_tokens"],
-            ref_text=loaded["ref_text"],
-            ref_rms=loaded["ref_rms"],
-        )
-        t_cell = time.time() - t0
-        logger.info(
-            "Voice cell loaded in %.2fs (ref_text=%r)",
-            t_cell,
-            self.voice_clone_prompt.ref_text,
-        )
+        if default_voice not in cells:
+            raise ValueError(f"Default voice {default_voice!r} is not in loaded cells")
 
-        self.cell_path = cell_path
+        for voice, cell_path in cells.items():
+            logger.info("Loading voice cell %s from %s", voice, cell_path)
+            t0 = time.time()
+            loaded = torch.load(cell_path, weights_only=False, map_location="cpu")
+            prompt = VoiceClonePrompt(
+                ref_audio_tokens=loaded["ref_audio_tokens"],
+                ref_text=loaded["ref_text"],
+                ref_rms=loaded["ref_rms"],
+            )
+            self.voice_clone_prompts[voice] = prompt
+            self.cell_paths[voice] = cell_path
+            t_cell = time.time() - t0
+            logger.info(
+                "Voice cell %s loaded in %.2fs (ref_text=%r)",
+                voice,
+                t_cell,
+                prompt.ref_text,
+            )
+
+        self.default_voice = default_voice
         self.model_id = model_id
         self.device = device
         self.dtype = dtype
         self.sampling_rate = self.model.sampling_rate
         self.startup_time = time.time() - t_start
         logger.info(
-            "Daemon ready in %.2fs (sampling_rate=%d Hz)",
+            "Daemon ready in %.2fs (voices=%s, default_voice=%s, sampling_rate=%d Hz)",
             self.startup_time,
+            ",".join(sorted(self.voice_clone_prompts)),
+            self.default_voice,
             self.sampling_rate,
         )
 
-    def generate_wav(self, req: SpeakRequest) -> bytes:
-        if self.model is None or self.voice_clone_prompt is None:
+    def next_sequence(self) -> int:
+        self._sequence += 1
+        return self._sequence
+
+    def generate_audio(self, req: SpeakRequest, voice: str):
+        if self.model is None or not self.voice_clone_prompts:
             raise RuntimeError("Daemon not initialized")
+        if voice not in self.voice_clone_prompts:
+            raise KeyError(voice)
 
         kwargs: dict = {
             "text": req.text,
-            "voice_clone_prompt": self.voice_clone_prompt,
+            "voice_clone_prompt": self.voice_clone_prompts[voice],
         }
         if req.speed is not None:
             kwargs["speed"] = req.speed
@@ -165,17 +211,81 @@ class DaemonState:
         audio_seconds = len(audio) / self.sampling_rate
         rtf = dt / audio_seconds if audio_seconds > 0 else float("inf")
         logger.info(
-            "spoke %d chars → %.2fs audio in %.2fs (RTF %.3f)",
+            "spoke voice=%s agent=%s priority=%s %d chars → %.2fs audio in %.2fs (RTF %.3f)",
+            voice,
+            req.agent,
+            req.priority,
             len(req.text),
             audio_seconds,
             dt,
             rtf,
         )
+        return audio
 
-        # Encode to WAV bytes (in-memory)
+    def encode_wav(self, audio) -> bytes:
         buf = io.BytesIO()
         sf.write(buf, audio, self.sampling_rate, format="WAV", subtype="PCM_16")
         return buf.getvalue()
+
+    async def worker_loop(self) -> None:
+        while True:
+            job = await self.queue.get()
+            try:
+                if job.future.cancelled():
+                    continue
+
+                job.started_at = time.time()
+                self.current_job = {
+                    "voice": job.voice,
+                    "agent": job.request.agent,
+                    "priority": job.request.priority,
+                    "text_chars": len(job.request.text),
+                    "enqueued_at": job.enqueued_at,
+                    "started_at": job.started_at,
+                    "wait_seconds": job.started_at - job.enqueued_at,
+                }
+
+                audio = await asyncio.to_thread(self.generate_audio, job.request, job.voice)
+                if job.future.cancelled():
+                    logger.info("client disconnected before encode; skipping wav encode")
+                    continue
+                wav_bytes = await asyncio.to_thread(self.encode_wav, audio)
+                if not job.future.cancelled():
+                    job.future.set_result(wav_bytes)
+            except Exception as exc:
+                logger.exception("queued generate failed")
+                if not job.future.cancelled():
+                    job.future.set_exception(exc)
+            finally:
+                self.current_job = None
+                self.queue.task_done()
+
+    def start_worker(self) -> None:
+        if self._worker_task is None or self._worker_task.done():
+            self._worker_task = asyncio.create_task(self.worker_loop())
+
+    def health_payload(self) -> dict:
+        return {
+            "status": "ok" if self.model is not None and self.voice_clone_prompts else "initializing",
+            "model_id": self.model_id,
+            "device": self.device,
+            "dtype": self.dtype,
+            "voices": sorted(self.voice_clone_prompts),
+            "default_voice": self.default_voice,
+            "cell_paths": {voice: str(path) for voice, path in sorted(self.cell_paths.items())},
+            "sampling_rate": self.sampling_rate,
+            "startup_time_seconds": self.startup_time,
+            "utterances_served": self.utterances_served,
+            "total_generate_seconds": self.total_generate_seconds,
+            "avg_generate_seconds": (
+                self.total_generate_seconds / self.utterances_served
+                if self.utterances_served
+                else None
+            ),
+            "queue_depth": self.queue.qsize(),
+            "current_job": self.current_job,
+            "waiters": self.queue.qsize() + (1 if self.current_job else 0),
+        }
 
 
 state = DaemonState()
@@ -191,36 +301,56 @@ app = FastAPI(title="omnivoice-daemon", version="0.1.0")
 
 @app.get("/health")
 async def health() -> JSONResponse:
-    return JSONResponse(
-        {
-            "status": "ok" if state.model is not None else "initializing",
-            "model_id": state.model_id,
-            "device": state.device,
-            "dtype": state.dtype,
-            "cell_path": str(state.cell_path) if state.cell_path else None,
-            "sampling_rate": state.sampling_rate,
-            "startup_time_seconds": state.startup_time,
-            "utterances_served": state.utterances_served,
-            "total_generate_seconds": state.total_generate_seconds,
-            "avg_generate_seconds": (
-                state.total_generate_seconds / state.utterances_served
-                if state.utterances_served
-                else None
-            ),
-        }
-    )
+    return JSONResponse(state.health_payload())
 
 
 @app.post("/speak")
-async def speak(req: SpeakRequest) -> Response:
-    if state.model is None or state.voice_clone_prompt is None:
+async def speak(req: SpeakRequest, request: Request) -> Response:
+    if state.model is None or not state.voice_clone_prompts:
         raise HTTPException(status_code=503, detail="Daemon not ready")
+    voice = req.voice or state.default_voice
+    if voice not in state.voice_clone_prompts:
+        raise HTTPException(status_code=404, detail=f"Unknown voice: {voice}")
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[bytes] = loop.create_future()
+    priority_rank = 0 if req.priority == "high" else 1
+    job = SpeakJob(
+        priority_rank=priority_rank,
+        sequence=state.next_sequence(),
+        request=req,
+        voice=voice,
+        future=future,
+    )
+    await state.queue.put(job)
+
     try:
-        wav_bytes = state.generate_wav(req)
+        while not future.done():
+            if await request.is_disconnected():
+                future.cancel()
+                detail = (
+                    "Client disconnected before synthesis"
+                    if job.started_at is None
+                    else "Client disconnected during synthesis"
+                )
+                raise HTTPException(status_code=499, detail=detail)
+            try:
+                wav_bytes = await asyncio.wait_for(asyncio.shield(future), timeout=0.1)
+                return Response(content=wav_bytes, media_type="audio/wav")
+            except asyncio.TimeoutError:
+                continue
+        wav_bytes = future.result()
     except Exception as exc:
+        if isinstance(exc, HTTPException):
+            raise exc
         logger.exception("generate failed")
         raise HTTPException(status_code=500, detail=str(exc))
     return Response(content=wav_bytes, media_type="audio/wav")
+
+
+@app.on_event("startup")
+async def startup() -> None:
+    state.start_worker()
 
 
 # -----------------------------------------------------------------------------
@@ -234,7 +364,18 @@ def parse_args() -> argparse.Namespace:
         "--cell",
         type=Path,
         default=Path(os.environ.get("OMNIVOICE_CELL_PATH", "")),
-        help="Path to .voiceclone.pt file (or set OMNIVOICE_CELL_PATH)",
+        help="Legacy single-voice .voiceclone.pt file (or set OMNIVOICE_CELL_PATH)",
+    )
+    parser.add_argument(
+        "--cells",
+        type=str,
+        default=os.environ.get("OMNIVOICE_CELLS", ""),
+        help="Comma list of voice=/path/to/cell.pt entries",
+    )
+    parser.add_argument(
+        "--default-voice",
+        type=str,
+        default=os.environ.get("OMNIVOICE_DEFAULT_VOICE", DEFAULT_VOICE),
     )
     parser.add_argument(
         "--model-id",
@@ -270,6 +411,39 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def parse_cells(cells_arg: str, legacy_cell: Path, default_voice: str) -> dict[str, Path]:
+    cells: dict[str, Path] = {}
+    if cells_arg:
+        for entry in cells_arg.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            if "=" not in entry:
+                raise ValueError(f"Invalid --cells entry {entry!r}; expected voice=/path")
+            voice, raw_path = entry.split("=", 1)
+            voice = voice.strip()
+            path = Path(raw_path.strip()).expanduser()
+            if not voice:
+                raise ValueError(f"Invalid --cells entry {entry!r}; voice key is empty")
+            if voice in cells:
+                raise ValueError(f"Duplicate voice key in --cells: {voice}")
+            if not path.exists():
+                raise FileNotFoundError(f"Voice cell for {voice!r} not found: {path}")
+            cells[voice] = path
+
+    if not cells and legacy_cell and str(legacy_cell) != "":
+        path = legacy_cell.expanduser()
+        if not path.exists():
+            raise FileNotFoundError(f"Voice cell not found: {path}")
+        cells[default_voice] = path
+
+    if not cells:
+        raise FileNotFoundError("No voice cells configured. Set --cells or --cell.")
+    if default_voice not in cells:
+        raise ValueError(f"Default voice {default_voice!r} is not in configured cells")
+    return cells
+
+
 def main() -> int:
     args = parse_args()
 
@@ -278,17 +452,19 @@ def main() -> int:
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
 
-    cell_path = args.cell
-    if not cell_path or str(cell_path) == "" or not cell_path.exists():
+    try:
+        cells = parse_cells(args.cells, args.cell, args.default_voice)
+    except Exception as exc:
         logger.error(
-            "Voice cell not found. Set --cell or OMNIVOICE_CELL_PATH to a "
-            "valid .voiceclone.pt file. Got: %r",
-            str(cell_path),
+            "Voice cell configuration invalid. Set --cells or --cell to valid "
+            ".voiceclone.pt files: %s",
+            exc,
         )
         return 2
 
     state.load(
-        cell_path=cell_path,
+        cells=cells,
+        default_voice=args.default_voice,
         model_id=args.model_id,
         device=args.device,
         dtype=args.dtype,
