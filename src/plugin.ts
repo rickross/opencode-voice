@@ -225,8 +225,14 @@ export const VoicePlugin: Plugin = async (input, options) => {
     // OmniVoice config
     omnivoiceEndpoint: voiceOptions?.omnivoiceEndpoint ?? agentConfig?.omnivoiceEndpoint ?? DEFAULT_OMNIVOICE_ENDPOINT,
     omnivoiceTimeoutMs: voiceOptions?.omnivoiceTimeoutMs ?? agentConfig?.omnivoiceTimeoutMs,
-    omnivoiceVoice: voiceOptions?.omnivoiceVoice ?? agentConfig?.omnivoiceVoice,
-    omnivoiceAgent: voiceOptions?.omnivoiceAgent ?? agentConfig?.omnivoiceAgent,
+    omnivoiceVoice:
+      voiceOptions?.omnivoiceVoice ??
+      agentConfig?.omnivoiceVoice ??
+      process.env.AGENT_NAME?.toLowerCase(),
+    omnivoiceAgent:
+      voiceOptions?.omnivoiceAgent ??
+      agentConfig?.omnivoiceAgent ??
+      process.env.AGENT_NAME?.toLowerCase(),
     // Runtime / shared
     enabled: runtimeState?.enabled ?? resolveEnabled(configuredEnabled),
     configuredEnabled,
