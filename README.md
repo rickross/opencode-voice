@@ -1,13 +1,15 @@
 # opencode-voice
 
-An [OpenCode](https://opencode.ai) plugin that adds text-to-speech capabilities using [ElevenLabs](https://elevenlabs.io) v3 with expressive audio tags.
+An [OpenCode](https://opencode.ai) plugin that adds text-to-speech capabilities using ElevenLabs voices with configurable model selection.
 
 ## Features
 
-- **ElevenLabs v3** - Uses the most expressive TTS model with audio tag support
+- **Configurable ElevenLabs models** - Defaults to `eleven_multilingual_v2`, with per-call overrides available
 - **Audio Tags** - Control emotions, delivery, reactions, accents, and sound effects inline
 - **Non-blocking** - Audio plays in background, control returns immediately
 - **Per-agent voices** - Each agent can have its own voice via a local config file
+- **Tagged auto-speak** - Speak only text wrapped in `<speak>...</speak>`
+- **Runtime voice mode** - Turn tagged speech on/off without editing config
 - **macOS Native** - Uses `afplay` for reliable audio playback
 
 ## Installation
@@ -50,7 +52,9 @@ Create a `voice.json` in each agent's project directory:
 
 ```json
 {
-  "voiceId": "your-voice-id-here"
+  "voiceId": "your-voice-id-here",
+  "modelId": "eleven_multilingual_v2",
+  "enabled": "on"
 }
 ```
 
@@ -78,10 +82,14 @@ Each agent loads its own voice on startup. No restart needed when switching betw
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `voiceId` | string | `YOq2y2Up4RgXP2HyXjE5` | ElevenLabs voice ID |
-| `modelId` | string | `eleven_v3` | ElevenLabs model ID |
+| `modelId` | string | `eleven_multilingual_v2` | ElevenLabs model ID |
 | `apiKeyPath` | string | `~/.config/opencode/secrets/elevenlabs-key` | Path to API key file |
+| `enabled` | `on \| off \| default` (or boolean) | `default` | Startup voice mode (`default` uses plugin default) |
 | `stability` | 0-1 | 0.5 | Lower = more expressive |
 | `similarityBoost` | 0-1 | 0.75 | Voice similarity |
+| `style` | 0-1 | unset | Optional style exaggeration |
+| `useSpeakerBoost` | boolean | unset | Optional speaker boost override |
+| `preserveVoiceDefaults` | boolean | `false` | Omit request-level voice settings when true |
 | `speed` | 0.5-2.0 | 1.0 | Speech speed |
 | `volume` | 0-2 | 1.0 | Playback volume |
 
@@ -96,6 +104,33 @@ speak("[excited] Hello! [laughs] This is amazing!")
 speak("[whispers] Something's coming... [sighs] I can feel it.")
 speak("[dramatically] The code is complete.")
 ```
+
+It also provides a `voice` tool for runtime control:
+
+```
+voice({ action: "status" })
+voice({ action: "off" })
+voice({ action: "on" })
+```
+
+## Tagged Auto-Speak
+
+When a completed assistant message contains `<speak>...</speak>`, only the tagged portion is spoken.
+The tags are stripped from visible output.
+
+Example:
+
+```xml
+<speak>Say this part aloud.</speak> But keep this part text-only.
+```
+
+Visible output becomes:
+
+```text
+Say this part aloud. But keep this part text-only.
+```
+
+Only `Say this part aloud.` is spoken.
 
 ### Audio Tags
 
@@ -112,8 +147,13 @@ speak("[dramatically] The code is complete.")
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `text` | string | required | Text with optional audio tags |
+| `voiceId` | string | from config | Optional per-call ElevenLabs voice ID override |
+| `modelId` | string | from config | Optional per-call ElevenLabs model ID override |
 | `stability` | 0-1 | from config | Lower = more expressive |
 | `similarity_boost` | 0-1 | from config | Voice similarity |
+| `style` | 0-1 | from config | Optional style exaggeration override |
+| `use_speaker_boost` | boolean | from config | Optional speaker boost override |
+| `preserveVoiceDefaults` | boolean | from config | If true, omit request-level voice_settings |
 | `speed` | 0.5-2.0 | from config | Speech speed |
 | `volume` | 0-2 | from config | Playback volume |
 
