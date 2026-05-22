@@ -123,6 +123,53 @@ function extractAllModeText(text: string): { cleanText: string; spokenText: stri
   return { cleanText, spokenText };
 }
 
+/**
+ * Normalize text for TTS. Strips common markdown syntax that should not
+ * be vocalized (asterisks for bold/italic/emphasis, backticks for code,
+ * leading list markers, heading hashes, link syntax). Preserves the
+ * underlying words and natural punctuation.
+ *
+ * This runs after speak/no-speak extraction and before sending to the
+ * provider. The displayed text is untouched — only the spoken stream
+ * is normalized.
+ */
+function normalizeForSpeech(text: string): string {
+  let out = text;
+
+  // Fenced code blocks: drop entirely. Inline code: keep the word, drop backticks.
+  out = out.replace(/```[\s\S]*?```/g, " ");
+  out = out.replace(/`([^`]*)`/g, "$1");
+
+  // Markdown links [label](url) -> label
+  out = out.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
+
+  // Bold / italic / emphasis markers (** *), keep inner text.
+  out = out.replace(/\*\*\*([^*]+)\*\*\*/g, "$1");
+  out = out.replace(/\*\*([^*]+)\*\*/g, "$1");
+  out = out.replace(/\*([^*\n]+)\*/g, "$1");
+  out = out.replace(/__([^_]+)__/g, "$1");
+  out = out.replace(/_([^_\n]+)_/g, "$1");
+
+  // Stray asterisks or underscores that didn't form a pair.
+  out = out.replace(/[*_]/g, "");
+
+  // Leading list/heading markers at start of lines.
+  out = out.replace(/^[ \t]{0,3}#{1,6}[ \t]+/gm, "");
+  out = out.replace(/^[ \t]{0,3}[-*+][ \t]+/gm, "");
+  out = out.replace(/^[ \t]{0,3}\d+[.)][ \t]+/gm, "");
+
+  // Blockquote markers.
+  out = out.replace(/^[ \t]{0,3}>[ \t]?/gm, "");
+
+  // Horizontal rules.
+  out = out.replace(/^[ \t]*[-*_]{3,}[ \t]*$/gm, " ");
+
+  // Collapse whitespace.
+  out = out.replace(/\s{2,}/g, " ").trim();
+
+  return out;
+}
+
 const AUDIO_TAG_EXAMPLES = `
 Audio Tags (v3 expressive features):
   Emotions: [laughs], [sighs], [whispers], [excited], [sad], [angry], [happily], [sarcastic], [curious]
@@ -210,15 +257,25 @@ export const VoicePlugin: Plugin = async (input, options) => {
     speed?: number;
     opts?: Record<string, unknown>;
   }): Promise<string> {
+    // Strip markdown/structural syntax that shouldn't be vocalized.
+    const speechText = normalizeForSpeech(args.text);
+
+    // Bail cleanly if normalization left nothing speakable.
+    if (!speechText) {
+      return `<speak_skipped>
+No speakable content after normalization.
+</speak_skipped>`;
+    }
+
     const handle = await provider.speak({
-      text: args.text,
+      text: speechText,
       volume: args.volume,
       speed: args.speed,
       opts: args.opts,
     });
 
     const preview =
-      args.text.length > 80 ? args.text.substring(0, 80) + "..." : args.text;
+      speechText.length > 80 ? speechText.substring(0, 80) + "..." : speechText;
     return `<speak_started>
 Playing speech (non-blocking): "${preview}"
 Provider: ${provider.name}
