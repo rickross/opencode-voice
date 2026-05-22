@@ -22,6 +22,8 @@ export interface ProviderConfigs {
   omnivoice: {
     endpoint: string;
     timeoutMs?: number;
+    voice?: string;
+    agent?: string;
   };
 }
 

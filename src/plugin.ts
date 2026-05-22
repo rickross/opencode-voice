@@ -57,6 +57,17 @@ export interface VoiceConfig {
   omnivoiceEndpoint?: string;
   /** Per-request timeout when calling the OmniVoice daemon (ms). */
   omnivoiceTimeoutMs?: number;
+  /**
+   * Which voice cell on the OmniVoice daemon to use for this agent.
+   * Omit to fall back to the daemon's configured default_voice.
+   */
+  omnivoiceVoice?: string;
+  /**
+   * Diagnostic caller id sent with every OmniVoice request. Surfaces in
+   * the daemon's /health endpoint and logs. Defaults to the agent name
+   * from environment if not specified.
+   */
+  omnivoiceAgent?: string;
 
   // --- Shared ---
   enabled?: boolean | "on" | "off" | "default";
@@ -214,6 +225,8 @@ export const VoicePlugin: Plugin = async (input, options) => {
     // OmniVoice config
     omnivoiceEndpoint: voiceOptions?.omnivoiceEndpoint ?? agentConfig?.omnivoiceEndpoint ?? DEFAULT_OMNIVOICE_ENDPOINT,
     omnivoiceTimeoutMs: voiceOptions?.omnivoiceTimeoutMs ?? agentConfig?.omnivoiceTimeoutMs,
+    omnivoiceVoice: voiceOptions?.omnivoiceVoice ?? agentConfig?.omnivoiceVoice,
+    omnivoiceAgent: voiceOptions?.omnivoiceAgent ?? agentConfig?.omnivoiceAgent,
     // Runtime / shared
     enabled: runtimeState?.enabled ?? resolveEnabled(configuredEnabled),
     configuredEnabled,
@@ -229,6 +242,8 @@ export const VoicePlugin: Plugin = async (input, options) => {
       return createProvider("omnivoice", {
         endpoint: config.omnivoiceEndpoint,
         timeoutMs: config.omnivoiceTimeoutMs,
+        voice: config.omnivoiceVoice,
+        agent: config.omnivoiceAgent,
       });
     }
     return createProvider("elevenlabs", {

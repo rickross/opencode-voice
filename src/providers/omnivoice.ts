@@ -18,6 +18,16 @@ export interface OmniVoiceConfig {
   endpoint: string;
   /** Optional per-request timeout in milliseconds. */
   timeoutMs?: number;
+  /**
+   * Which voice cell the daemon should use for this agent.
+   * Omit to fall back to the daemon's configured default_voice.
+   */
+  voice?: string;
+  /**
+   * Diagnostic caller id sent on every request. Used by the daemon's
+   * /health surface and logs. Not used for routing or auth.
+   */
+  agent?: string;
 }
 
 /**
@@ -26,6 +36,12 @@ export interface OmniVoiceConfig {
 export interface OmniVoiceRequestOpts {
   /** Diffusion steps. 16 = faster, 32 = default quality. */
   numStep?: number;
+  /**
+   * Per-request priority. "high" jumps ahead of normal-priority jobs
+   * in the daemon's queue (without preempting the currently-running
+   * generation). Defaults to "normal" if omitted.
+   */
+  priority?: "normal" | "high";
 }
 
 const DEFAULT_TIMEOUT_MS = 60_000;
@@ -104,6 +120,9 @@ export function createOmniVoiceProvider(config: OmniVoiceConfig): TTSProvider {
       const body: Record<string, unknown> = { text: req.text };
       if (req.speed !== undefined) body.speed = req.speed;
       if (opts.numStep !== undefined) body.num_step = opts.numStep;
+      if (config.voice !== undefined) body.voice = config.voice;
+      if (config.agent !== undefined) body.agent = config.agent;
+      if (opts.priority !== undefined) body.priority = opts.priority;
 
       const controller = new AbortController();
       const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
