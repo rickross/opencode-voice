@@ -2,13 +2,14 @@ import { tool, type Plugin } from "@opencode-ai/plugin";
 import { readFileSync, existsSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
-import { spawn } from "child_process";
+import { createProvider, type ProviderName, type TTSProvider } from "./providers/index.js";
 
 /**
  * Default constants
  */
 const DEFAULT_VOICE_ID = "YOq2y2Up4RgXP2HyXjE5";
 const DEFAULT_MODEL_ID = "eleven_multilingual_v2";
+const DEFAULT_PROVIDER: ProviderName = "elevenlabs";
 const DEFAULT_ENABLED = true;
 const DEFAULT_API_KEY_PATH = join(
   homedir(),
@@ -26,12 +27,15 @@ const STATE_FILE = "voice-state.json";
  *
  * Example voice.json:
  *   {
+ *     "provider": "elevenlabs",
  *     "voiceId": "abc123",
- *     "modelId": "eleven_v3",
+ *     "modelId": "eleven_multilingual_v2",
  *     "stability": 0.4
  *   }
  */
 export interface VoiceConfig {
+  /** Which TTS backend to use. Defaults to "elevenlabs". */
+  provider?: ProviderName;
   voiceId?: string;
   modelId?: string;
   /** Path to file containing the ElevenLabs API key */
@@ -63,37 +67,12 @@ function resolveEnabled(value: VoiceConfig["enabled"] | undefined): boolean {
   return DEFAULT_ENABLED;
 }
 
-type SpeakRequest = {
-  text: string;
-  voiceId: string;
-  modelId: string;
-  apiKeyPath: string;
-  stability?: number;
-  similarityBoost?: number;
-  style?: number;
-  useSpeakerBoost?: boolean;
-  speed?: number;
-  volume: number;
-  preserveVoiceDefaults?: boolean;
-};
-
 function readJsonFile<T>(filePath: string): T | undefined {
   if (!existsSync(filePath)) return undefined;
   try {
     return JSON.parse(readFileSync(filePath, "utf-8")) as T;
   } catch {
     return undefined;
-  }
-}
-
-function loadApiKey(apiKeyPath: string): string {
-  try {
-    return readFileSync(apiKeyPath, "utf-8").trim();
-  } catch {
-    throw new Error(
-      `Failed to read ElevenLabs API key from ${apiKeyPath}. ` +
-        `Please create this file with your API key.`
-    );
   }
 }
 
@@ -120,101 +99,14 @@ function extractSpeakBlocks(text: string): { cleanText: string; spokenText: stri
  * tags is spoken.
  */
 function extractAllModeText(text: string): { cleanText: string; spokenText: string } {
-  // Remove <no-speak> blocks entirely from the spoken version
   const spokenText = text
     .replace(/<no-speak>[\s\S]*?<\/no-speak>/gi, " ")
     .replace(/\s{2,}/g, " ")
     .trim();
 
-  // Strip just the tags from the displayed text, keeping the content visible
   const cleanText = text.replace(/<\/?no-speak>/gi, "");
 
   return { cleanText, spokenText };
-}
-
-function streamAudio(stream: ReadableStream, volume: number): void {
-  // sox `play` reads mp3 from stdin — lightweight, no GUI
-  const child = spawn(
-    "play",
-    ["-v", String(volume), "-t", "mp3", "-"],
-    { detached: true, stdio: ["pipe", "ignore", "ignore"] }
-  );
-  child.unref();
-
-  const reader = stream.getReader();
-  const stdin = child.stdin!;
-
-  (async () => {
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) { stdin.end(); break; }
-        stdin.write(value);
-      }
-    } catch {
-      stdin.end();
-    }
-  })();
-}
-
-async function startSpeech(request: SpeakRequest): Promise<string> {
-  const {
-    text,
-    voiceId,
-    modelId,
-    apiKeyPath,
-    stability,
-    similarityBoost,
-    style,
-    useSpeakerBoost,
-    speed,
-    volume,
-    preserveVoiceDefaults,
-  } = request;
-
-  const apiKey = loadApiKey(apiKeyPath);
-
-  const voiceSettings = preserveVoiceDefaults
-    ? undefined
-    : {
-        ...(stability !== undefined ? { stability } : {}),
-        ...(similarityBoost !== undefined ? { similarity_boost: similarityBoost } : {}),
-        ...(style !== undefined ? { style } : {}),
-        ...(useSpeakerBoost !== undefined ? { use_speaker_boost: useSpeakerBoost } : {}),
-        ...(speed !== undefined ? { speed } : {}),
-      };
-
-  const body = {
-    text,
-    model_id: modelId,
-    ...(voiceSettings && Object.keys(voiceSettings).length ? { voice_settings: voiceSettings } : {}),
-  };
-
-  const response = await fetch(
-    `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?output_format=mp3_44100_128`,
-    {
-      method: "POST",
-      headers: {
-        "xi-api-key": apiKey,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-    }
-  );
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`ElevenLabs API error (${response.status}): ${errorText}`);
-  }
-
-  streamAudio(response.body!, volume);
-
-  const preview = text.length > 80 ? text.substring(0, 80) + "..." : text;
-  return `<speak_started>
-Playing speech (non-blocking): "${preview}"
-Voice: ${voiceId}
-Model: ${modelId}
-</speak_started>`;
 }
 
 const AUDIO_TAG_EXAMPLES = `
@@ -232,7 +124,7 @@ Example: "[excited] We did it! [laughs] I can't believe it worked!"
 /**
  * Config resolution order (later overrides earlier):
  *   1. Built-in defaults
-  *   2. <agent-dir>/voice.json  (input.directory at runtime)
+ *   2. <agent-dir>/voice.json  (input.directory at runtime)
  *   3. Plugin options from opencode.json
  */
 export const VoicePlugin: Plugin = async (input, options) => {
@@ -248,6 +140,7 @@ export const VoicePlugin: Plugin = async (input, options) => {
 
   // Merge: defaults < agent voice.json < inline plugin options
   const config = {
+    provider: (voiceOptions?.provider ?? agentConfig?.provider ?? DEFAULT_PROVIDER) as ProviderName,
     voiceId: voiceOptions?.voiceId ?? agentConfig?.voiceId ?? DEFAULT_VOICE_ID,
     modelId: voiceOptions?.modelId ?? agentConfig?.modelId ?? DEFAULT_MODEL_ID,
     apiKeyPath: voiceOptions?.apiKeyPath ?? agentConfig?.apiKeyPath ?? DEFAULT_API_KEY_PATH,
@@ -263,11 +156,51 @@ export const VoicePlugin: Plugin = async (input, options) => {
     volume: voiceOptions?.volume ?? agentConfig?.volume ?? 1.0,
   };
 
-  const speakTool = tool({
-    description: `Convert text to speech using ElevenLabs v3 and play it on the device speakers (non-blocking).
+  // Instantiate the provider once at plugin init.
+  const provider: TTSProvider = createProvider(config.provider, {
+    voiceId: config.voiceId,
+    modelId: config.modelId,
+    apiKeyPath: config.apiKeyPath,
+    stability: config.stability,
+    similarityBoost: config.similarityBoost,
+    style: config.style,
+    useSpeakerBoost: config.useSpeakerBoost,
+    preserveVoiceDefaults: config.preserveVoiceDefaults,
+  });
 
-Uses the expressive v3 model which supports inline audio tags for emotional control, 
-delivery direction, non-verbal reactions, accents, and sound effects.
+  /**
+   * Internal helper that drives a request through the provider and returns
+   * a confirmation string in the same shape startSpeech() used to return.
+   * Errors are surfaced to the caller; the provider's playback runs
+   * non-blocking via its returned handle.
+   */
+  async function speakViaProvider(args: {
+    text: string;
+    volume: number;
+    speed?: number;
+    opts?: Record<string, unknown>;
+  }): Promise<string> {
+    const handle = await provider.speak({
+      text: args.text,
+      volume: args.volume,
+      speed: args.speed,
+      opts: args.opts,
+    });
+
+    const preview =
+      args.text.length > 80 ? args.text.substring(0, 80) + "..." : args.text;
+    return `<speak_started>
+Playing speech (non-blocking): "${preview}"
+Provider: ${provider.name}
+Handle: ${handle.id}
+</speak_started>`;
+  }
+
+  const speakTool = tool({
+    description: `Convert text to speech and play it on the device speakers (non-blocking).
+
+The active TTS provider is determined by the agent's voice.json (default: elevenlabs).
+When using ElevenLabs, inline audio tags are supported for expressive control.
 
 ${AUDIO_TAG_EXAMPLES}
 
@@ -313,29 +246,33 @@ USAGE GUIDANCE:
     async execute(args) {
       const {
         text,
-        voiceId = config.voiceId,
-        modelId = config.modelId,
-        stability = config.stability,
-        similarity_boost = config.similarityBoost,
-        style = config.style,
-        use_speaker_boost = config.useSpeakerBoost,
-        preserveVoiceDefaults = config.preserveVoiceDefaults,
+        voiceId,
+        modelId,
+        stability,
+        similarity_boost,
+        style,
+        use_speaker_boost,
+        preserveVoiceDefaults,
         speed = config.speed,
         volume = config.volume,
       } = args;
 
-      return startSpeech({
+      // Pass any provider-specific overrides through `opts`.
+      // The current providers (only elevenlabs so far) read what they need.
+      const opts: Record<string, unknown> = {};
+      if (voiceId !== undefined) opts.voiceId = voiceId;
+      if (modelId !== undefined) opts.modelId = modelId;
+      if (stability !== undefined) opts.stability = stability;
+      if (similarity_boost !== undefined) opts.similarityBoost = similarity_boost;
+      if (style !== undefined) opts.style = style;
+      if (use_speaker_boost !== undefined) opts.useSpeakerBoost = use_speaker_boost;
+      if (preserveVoiceDefaults !== undefined) opts.preserveVoiceDefaults = preserveVoiceDefaults;
+
+      return speakViaProvider({
         text,
-        voiceId,
-        modelId,
-        apiKeyPath: config.apiKeyPath,
-        stability,
-        similarityBoost: similarity_boost,
-        style,
-        useSpeakerBoost: use_speaker_boost,
-        speed,
         volume,
-        preserveVoiceDefaults,
+        speed,
+        opts: Object.keys(opts).length ? opts : undefined,
       });
     },
   });
@@ -359,6 +296,7 @@ USAGE GUIDANCE:
             enabled: config.enabled,
             speakMode: config.speakMode,
             configuredEnabled: config.configuredEnabled,
+            provider: config.provider,
             voiceId: config.voiceId,
             modelId: config.modelId,
             preserveVoiceDefaults: config.preserveVoiceDefaults,
@@ -396,18 +334,10 @@ USAGE GUIDANCE:
         : extractSpeakBlocks(output.text);
       output.text = cleanText;
       if (!spokenText) return;
-      void startSpeech({
+      void speakViaProvider({
         text: spokenText,
-        voiceId: config.voiceId,
-        modelId: config.modelId,
-        apiKeyPath: config.apiKeyPath,
-        stability: config.stability,
-        similarityBoost: config.similarityBoost,
-        style: config.style,
-        useSpeakerBoost: config.useSpeakerBoost,
-        speed: config.speed,
         volume: config.volume,
-        preserveVoiceDefaults: config.preserveVoiceDefaults,
+        speed: config.speed,
       }).catch((error) => {
         console.error("[opencode-voice] tagged speak failed:", error);
       });
