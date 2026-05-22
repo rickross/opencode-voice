@@ -107,11 +107,21 @@ function writeJsonFile(filePath: string, value: unknown): void {
 
 function extractSpeakBlocks(text: string): { cleanText: string; spokenText: string } {
   const spoken: string[] = [];
-  const cleanText = text.replace(/<speak>([\s\S]*?)<\/speak>/gi, (_match, inner) => {
-    const trimmed = String(inner).trim();
-    if (trimmed) spoken.push(trimmed);
-    return trimmed;
-  });
+
+  // Match <speak>...</speak> blocks. If the closing tag is missing, fall back
+  // to the next paragraph boundary (blank line) or end of input. This makes
+  // the markup forgiving of a common author mistake — opening a speak block
+  // and then drifting on without closing it. The implicit close at \n\n
+  // preserves the natural unit of speech (one paragraph) without
+  // accidentally vocalizing subsequent technical content.
+  const cleanText = text.replace(
+    /<speak>([\s\S]*?)(?:<\/speak>|\n\n|$)/gi,
+    (_match, inner) => {
+      const trimmed = String(inner).trim();
+      if (trimmed) spoken.push(trimmed);
+      return trimmed;
+    },
+  );
   return {
     cleanText,
     spokenText: spoken.join("\n"),
