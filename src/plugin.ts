@@ -16,6 +16,8 @@ const DEFAULT_API_KEY_PATH = join(
   ".config/opencode/secrets/elevenlabs-key"
 );
 const DEFAULT_OMNIVOICE_ENDPOINT = "http://127.0.0.1:7345";
+const DEFAULT_QWEN3_TTS_ENDPOINT = "http://zion.irelate.ai:5009";
+const DEFAULT_QWEN3_TTS_MODEL = "/model";
 const CONFIG_FILE = "voice.json";
 const STATE_FILE = "voice-state.json";
 
@@ -68,6 +70,42 @@ export interface VoiceConfig {
    * from environment if not specified.
    */
   omnivoiceAgent?: string;
+
+  // --- Qwen3-TTS fields ---
+  /**
+   * Qwen3-TTS endpoint, e.g. "http://zion.irelate.ai:5009".
+   * Defaults to http://zion.irelate.ai:5009 when provider is "qwen3-tts".
+   */
+  qwen3TtsEndpoint?: string;
+  /** Per-request timeout when calling the Qwen3-TTS endpoint (ms). */
+  qwen3TtsTimeoutMs?: number;
+  /**
+   * Which voice (registered in vllm-omni's voice registry) to use for
+   * this agent. E.g. "solene", "aurora", "telos". Defaults to the
+   * lowercased AGENT_NAME from environment if not specified.
+   */
+  qwen3TtsVoice?: string;
+  /**
+   * Model identifier as seen by vllm-omni's OpenAI-compatible endpoint.
+   * Defaults to "/model" — matches the qwen3-tts.service ExecStart.
+   */
+  qwen3TtsModel?: string;
+  /**
+   * Diagnostic caller id sent with every Qwen3-TTS request. Defaults to
+   * the agent name from environment if not specified.
+   */
+  qwen3TtsAgent?: string;
+  /**
+   * Default natural-language prosody / style directive for this agent
+   * when using qwen3-tts. Applied to every utterance unless overridden
+   * per-call via the `speak` tool's `opts.instruct` argument.
+   *
+   * Examples:
+   *   "Warm, intimate tone with French sensibility."
+   *   "Calm and professional."
+   *   "Slow, contemplative, whispered."
+   */
+  qwen3TtsInstruct?: string;
 
   // --- Shared ---
   enabled?: boolean | "on" | "off" | "default";
@@ -243,6 +281,19 @@ export const VoicePlugin: Plugin = async (input, options) => {
       voiceOptions?.omnivoiceAgent ??
       agentConfig?.omnivoiceAgent ??
       process.env.AGENT_NAME?.toLowerCase(),
+    // Qwen3-TTS config
+    qwen3TtsEndpoint: voiceOptions?.qwen3TtsEndpoint ?? agentConfig?.qwen3TtsEndpoint ?? DEFAULT_QWEN3_TTS_ENDPOINT,
+    qwen3TtsTimeoutMs: voiceOptions?.qwen3TtsTimeoutMs ?? agentConfig?.qwen3TtsTimeoutMs,
+    qwen3TtsVoice:
+      voiceOptions?.qwen3TtsVoice ??
+      agentConfig?.qwen3TtsVoice ??
+      process.env.AGENT_NAME?.toLowerCase(),
+    qwen3TtsModel: voiceOptions?.qwen3TtsModel ?? agentConfig?.qwen3TtsModel ?? DEFAULT_QWEN3_TTS_MODEL,
+    qwen3TtsAgent:
+      voiceOptions?.qwen3TtsAgent ??
+      agentConfig?.qwen3TtsAgent ??
+      process.env.AGENT_NAME?.toLowerCase(),
+    qwen3TtsInstruct: voiceOptions?.qwen3TtsInstruct ?? agentConfig?.qwen3TtsInstruct,
     // Runtime / shared
     enabled: runtimeState?.enabled ?? resolveEnabled(configuredEnabled),
     configuredEnabled,
@@ -260,6 +311,16 @@ export const VoicePlugin: Plugin = async (input, options) => {
         timeoutMs: config.omnivoiceTimeoutMs,
         voice: config.omnivoiceVoice,
         agent: config.omnivoiceAgent,
+      });
+    }
+    if (config.provider === "qwen3-tts") {
+      return createProvider("qwen3-tts", {
+        endpoint: config.qwen3TtsEndpoint,
+        timeoutMs: config.qwen3TtsTimeoutMs,
+        voice: config.qwen3TtsVoice,
+        model: config.qwen3TtsModel,
+        agent: config.qwen3TtsAgent,
+        instruct: config.qwen3TtsInstruct,
       });
     }
     return createProvider("elevenlabs", {
@@ -359,6 +420,12 @@ USAGE GUIDANCE:
         .describe("Speech speed multiplier (0.5-2.0). Default from config."),
       volume: tool.schema.number().min(0).max(2).optional()
         .describe("Playback volume (0-2). Default from config."),
+      instruct: tool.schema.string().optional()
+        .describe(
+          "Natural-language prosody / style directive for this utterance. " +
+          "Supported by qwen3-tts only; ignored by other providers. " +
+          "Examples: 'Whispered, intimate.' / 'Excited, animated.' / 'Calm and slow.'"
+        ),
     },
 
     async execute(args) {
@@ -371,12 +438,13 @@ USAGE GUIDANCE:
         style,
         use_speaker_boost,
         preserveVoiceDefaults,
+        instruct,
         speed = config.speed,
         volume = config.volume,
       } = args;
 
       // Pass any provider-specific overrides through `opts`.
-      // The current providers (only elevenlabs so far) read what they need.
+      // Each provider reads what it knows about and ignores the rest.
       const opts: Record<string, unknown> = {};
       if (voiceId !== undefined) opts.voiceId = voiceId;
       if (modelId !== undefined) opts.modelId = modelId;
@@ -385,6 +453,7 @@ USAGE GUIDANCE:
       if (style !== undefined) opts.style = style;
       if (use_speaker_boost !== undefined) opts.useSpeakerBoost = use_speaker_boost;
       if (preserveVoiceDefaults !== undefined) opts.preserveVoiceDefaults = preserveVoiceDefaults;
+      if (instruct !== undefined) opts.instruct = instruct;
 
       return speakViaProvider({
         text,

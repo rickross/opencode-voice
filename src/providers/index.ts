@@ -1,5 +1,6 @@
 import { createElevenLabsProvider } from "./elevenlabs.js";
 import { createOmniVoiceProvider } from "./omnivoice.js";
+import { createQwen3TtsProvider } from "./qwen3-tts.js";
 import type { TTSProvider } from "./types.js";
 
 /**
@@ -25,6 +26,14 @@ export interface ProviderConfigs {
     voice?: string;
     agent?: string;
   };
+  "qwen3-tts": {
+    endpoint: string;
+    timeoutMs?: number;
+    voice?: string;
+    model?: string;
+    agent?: string;
+    instruct?: string;
+  };
 }
 
 export type ProviderName = keyof ProviderConfigs;
@@ -45,6 +54,9 @@ export function createProvider<P extends ProviderName>(
   }
   if (name === "omnivoice") {
     return createOmniVoiceProvider(config as ProviderConfigs["omnivoice"]);
+  }
+  if (name === "qwen3-tts") {
+    return createQwen3TtsProvider(config as ProviderConfigs["qwen3-tts"]);
   }
   throw new Error(`Unknown TTS provider: ${String(name)}`);
 }
