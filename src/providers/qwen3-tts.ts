@@ -1,5 +1,29 @@
 import { spawn } from "child_process";
+import { appendFileSync } from "fs";
 import type { TTSProvider, TTSRequest, PlaybackHandle } from "./types.js";
+
+/**
+ * Side-channel observability log. Written directly from the provider
+ * regardless of how OpenCode routes (or fails to route) plugin stderr.
+ * One JSON-line per event for trivial parsing and tail -f.
+ *
+ * tail -f /tmp/qwen3-tts-trace.log    # watch live
+ * jq -c '.' < /tmp/qwen3-tts-trace.log  # validate / reformat
+ */
+const TRACE_PATH = "/tmp/qwen3-tts-trace.log";
+
+function trace(event: string, data: Record<string, unknown> = {}): void {
+  try {
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      event,
+      ...data,
+    });
+    appendFileSync(TRACE_PATH, line + "\n");
+  } catch {
+    /* observability is best-effort; never block on a log failure */
+  }
+}
 
 /**
  * Qwen3-TTS provider.
@@ -52,6 +76,20 @@ export interface Qwen3TtsConfig {
    * TTSRequest.opts.instruct.
    */
   instruct?: string;
+  /**
+   * Language hint sent per-request to stabilize accent. Accepted by
+   * vllm-omni v0.22+: "Auto", "English", "French", "Chinese",
+   * "Japanese", "Korean", "German", "Russian", "Portuguese",
+   * "Spanish", "Italian". Omit to use server default.
+   */
+  language?: string;
+  /**
+   * Request streaming PCM output (response_format=pcm + stream=true).
+   * When true, the response body is raw 16-bit signed mono PCM at
+   * 24kHz, piped directly into `play -t raw` for low TTFB (~10ms vs
+   * ~1.9s for non-streaming WAV). Defaults to true.
+   */
+  stream?: boolean;
 }
 
 /**
@@ -69,6 +107,26 @@ export interface Qwen3TtsRequestOpts {
 
 const DEFAULT_TIMEOUT_MS = 90_000;
 const DEFAULT_MODEL = "/model";
+const DEFAULT_STREAM = true;
+const PCM_SAMPLE_RATE_HZ = 24_000;
+const PROVIDER_BUILD = "2026-06-03-v8-streaming-pcm";
+
+// Side-channel observability: write a sentinel file at module load so we can
+// verify *outside the log* which build OpenCode actually picked up. This file
+// is overwritten on every load, including double-loads (we'll see the most
+// recent loadedAt timestamp).
+try {
+  const { writeFileSync } = require("fs");
+  writeFileSync(
+    "/tmp/qwen3-tts-build.txt",
+    `build=${PROVIDER_BUILD}\nloadedAt=${new Date().toISOString()}\npid=${process.pid}\n`,
+  );
+} catch {
+  /* sentinel write best-effort; never block plugin load */
+}
+
+trace("module_loaded", { build: PROVIDER_BUILD, pid: process.pid });
+console.error(`[qwen3-tts] provider module loaded build=${PROVIDER_BUILD} pid=${process.pid}`);
 
 let handleCounter = 0;
 function nextHandleId(): string {
@@ -77,7 +135,15 @@ function nextHandleId(): string {
 }
 
 /**
- * Pipe a streaming WAV response body into `sox play` via stdin.
+ * Pipe a streaming response body into `sox play` via stdin.
+ *
+ * Supports two input formats:
+ *   - "wav": legacy non-streaming path; the server returns a WAV body
+ *     with a normal RIFF header, which sox parses from the stream.
+ *   - "pcm": v0.22+ streaming path; the server returns raw 16-bit
+ *     signed mono PCM at 24kHz with no header. `play -t raw` is told
+ *     the rate / sample width / channel count explicitly so it can
+ *     start emitting audio on the first chunk (~10ms TTFB).
  *
  * The pattern mirrors the OmniVoice provider's stream handler. Kept
  * inline here (rather than shared) so the provider remains self-contained;
@@ -86,9 +152,46 @@ function nextHandleId(): string {
 function streamAudioToPlayer(
   stream: ReadableStream,
   volume: number,
+  callId: string,
+  format: "wav" | "pcm",
 ): { stop: () => void; done: Promise<void> } {
-  const child = spawn("play", ["-v", String(volume), "-t", "wav", "-"], {
-    stdio: ["pipe", "ignore", "ignore"],
+  const spawnStart = Date.now();
+  const playArgs =
+    format === "pcm"
+      ? [
+          "-v",
+          String(volume),
+          "-t",
+          "raw",
+          "-r",
+          String(PCM_SAMPLE_RATE_HZ),
+          "-e",
+          "signed",
+          "-b",
+          "16",
+          "-c",
+          "1",
+          "-",
+        ]
+      : ["-v", String(volume), "-t", "wav", "-"];
+  const child = spawn("play", playArgs, {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  trace("play_spawn", {
+    call_id: callId,
+    pid: child.pid,
+    format,
+    spawn_ms: Date.now() - spawnStart,
+  });
+
+  child.stderr?.on("data", (data) => {
+    trace("play_stderr", { call_id: callId, line: data.toString().trim() });
+  });
+  child.on("error", (err) => {
+    trace("play_error", { call_id: callId, error: err.message });
+  });
+  child.on("exit", (code, signal) => {
+    trace("play_exit", { call_id: callId, code, signal, duration_ms: Date.now() - spawnStart });
   });
 
   const done = new Promise<void>((resolve) => {
@@ -99,17 +202,34 @@ function streamAudioToPlayer(
   const reader = stream.getReader();
   const stdin = child.stdin!;
   let cancelled = false;
+  let firstChunkAt: number | undefined;
+  let chunkCount = 0;
+  let totalBytes = 0;
+  const streamStart = Date.now();
 
   (async () => {
     try {
       while (!cancelled) {
         const { done: readDone, value } = await reader.read();
         if (readDone) break;
+        if (firstChunkAt === undefined) {
+          firstChunkAt = Date.now();
+          trace("first_chunk", { call_id: callId, bytes: value.length, after_fetch_ms: firstChunkAt - streamStart });
+        }
+        chunkCount += 1;
+        totalBytes += value.length;
         if (!stdin.write(value)) {
           await new Promise<void>((resolve) => stdin.once("drain", resolve));
         }
       }
-    } catch {
+      trace("stream_complete", {
+        call_id: callId,
+        chunks: chunkCount,
+        total_bytes: totalBytes,
+        duration_ms: Date.now() - streamStart,
+      });
+    } catch (err) {
+      trace("stream_error", { call_id: callId, error: (err as Error).message });
       // network or stream errors — fall through and end stdin
     } finally {
       try {
@@ -141,11 +261,26 @@ export function createQwen3TtsProvider(config: Qwen3TtsConfig): TTSProvider {
   const endpoint = config.endpoint.replace(/\/+$/, "");
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const model = config.model ?? DEFAULT_MODEL;
+  const stream = config.stream ?? DEFAULT_STREAM;
+  const responseFormat = stream ? "pcm" : "wav";
+  const playerFormat: "wav" | "pcm" = stream ? "pcm" : "wav";
 
   return {
     name: "qwen3-tts",
 
     async speak(req: TTSRequest): Promise<PlaybackHandle> {
+      const callId = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      trace("speak_called", {
+        call_id: callId,
+        build: PROVIDER_BUILD,
+        voice: config.voice,
+        model,
+        endpoint,
+        language: config.language,
+        stream,
+        chars: req.text.length,
+        preview: req.text.substring(0, 80),
+      });
       const opts = (req.opts ?? {}) as Qwen3TtsRequestOpts;
 
       // Resolve instruct: per-call override wins, then config-level default,
@@ -156,13 +291,18 @@ export function createQwen3TtsProvider(config: Qwen3TtsConfig): TTSProvider {
         undefined;
 
       // Build OpenAI-compatible speech request body.
-      // Fields supported by vllm-omni's /v1/audio/speech:
-      //   model:    required — the served model identifier
-      //   input:    required — the text to synthesize
-      //   voice:    optional — registered voice name on the server
-      //   speed:    optional — speech rate multiplier
-      //   instruct: optional — natural-language prosody directive
-      //                        (Qwen3-TTS specific feature)
+      // Fields supported by vllm-omni's /v1/audio/speech (v0.22+):
+      //   model:           required — the served model identifier ("/model")
+      //   input:           required — the text to synthesize
+      //   voice:           optional — registered voice name on the server
+      //   speed:           optional — speech rate multiplier
+      //   instruct:        optional — natural-language prosody directive
+      //   language:        optional — language hint ("French" / "English" / …)
+      //                    pinned per-request to stabilize accent across
+      //                    code-switching utterances
+      //   stream:          optional — when true, response is streamed
+      //   response_format: optional — "pcm" for raw 16-bit / 24kHz / mono
+      //                    streaming (low TTFB), "wav" for legacy buffered
       const body: Record<string, unknown> = {
         model,
         input: req.text,
@@ -170,12 +310,19 @@ export function createQwen3TtsProvider(config: Qwen3TtsConfig): TTSProvider {
       if (config.voice !== undefined) body.voice = config.voice;
       if (req.speed !== undefined) body.speed = req.speed;
       if (instruct !== undefined) body.instruct = instruct;
+      if (config.language !== undefined) body.language = config.language;
+      if (stream) {
+        body.stream = true;
+        body.response_format = responseFormat;
+      }
       if (config.agent !== undefined) body.user = config.agent;
 
       const controller = new AbortController();
       const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
 
       let response: Response;
+      const fetchStart = Date.now();
+      trace("fetch_start", { call_id: callId, url: `${endpoint}/v1/audio/speech`, body_size: JSON.stringify(body).length });
       try {
         response = await fetch(`${endpoint}/v1/audio/speech`, {
           method: "POST",
@@ -185,6 +332,7 @@ export function createQwen3TtsProvider(config: Qwen3TtsConfig): TTSProvider {
         });
       } catch (err) {
         clearTimeout(timeoutHandle);
+        trace("fetch_error", { call_id: callId, error: (err as Error).message, latency_ms: Date.now() - fetchStart });
         const message =
           err instanceof Error && err.name === "AbortError"
             ? `Qwen3-TTS endpoint request timed out after ${timeoutMs}ms`
@@ -208,8 +356,18 @@ export function createQwen3TtsProvider(config: Qwen3TtsConfig): TTSProvider {
       if (!response.body) {
         throw new Error("Qwen3-TTS endpoint returned no body");
       }
+      trace("fetch_ok", {
+        call_id: callId,
+        status: response.status,
+        latency_ms: Date.now() - fetchStart,
+        content_type: response.headers.get("content-type"),
+        transfer_encoding: response.headers.get("transfer-encoding"),
+        content_length: response.headers.get("content-length"),
+      });
 
-      const { stop, done } = streamAudioToPlayer(response.body, req.volume);
+      const { stop, done } = streamAudioToPlayer(response.body, req.volume, callId, playerFormat);
+
+      done.then(() => trace("playback_done", { call_id: callId })).catch((e) => trace("playback_error", { call_id: callId, error: String(e) }));
 
       return {
         id: nextHandleId(),

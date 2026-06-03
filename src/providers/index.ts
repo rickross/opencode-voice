@@ -33,6 +33,8 @@ export interface ProviderConfigs {
     model?: string;
     agent?: string;
     instruct?: string;
+    language?: string;
+    stream?: boolean;
   };
 }
 
