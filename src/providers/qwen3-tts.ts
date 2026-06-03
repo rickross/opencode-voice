@@ -596,7 +596,11 @@ export function createQwen3TtsProvider(config: Qwen3TtsConfig): TTSProvider {
         input: req.text,
       };
       if (config.voice !== undefined) body.voice = config.voice;
-      if (req.speed !== undefined) body.speed = req.speed;
+      // vllm-omni v0.22 rejects `speed` when streaming with a 400. Only
+      // send speed on the buffered path. (The streaming path runs at the
+      // model's native rate; per-utterance pacing can be adjusted via the
+      // `instruct` field if needed.)
+      if (req.speed !== undefined && !stream) body.speed = req.speed;
       if (instruct !== undefined) body.instruct = instruct;
       if (config.language !== undefined) body.language = config.language;
       if (stream) {
