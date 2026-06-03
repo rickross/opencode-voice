@@ -1,5 +1,7 @@
 import { spawn } from "child_process";
 import { appendFileSync } from "fs";
+import { request as httpRequest, type IncomingMessage } from "http";
+import { URL } from "url";
 import type { TTSProvider, TTSRequest, PlaybackHandle } from "./types.js";
 
 /**
@@ -109,7 +111,7 @@ const DEFAULT_TIMEOUT_MS = 90_000;
 const DEFAULT_MODEL = "/model";
 const DEFAULT_STREAM = true;
 const PCM_SAMPLE_RATE_HZ = 24_000;
-const PROVIDER_BUILD = "2026-06-03-v10-streaming-no-keepalive";
+const PROVIDER_BUILD = "2026-06-03-v11-streaming-http-request";
 
 // Side-channel observability: write a sentinel file at module load so we can
 // verify *outside the log* which build OpenCode actually picked up. This file
@@ -132,6 +134,214 @@ let handleCounter = 0;
 function nextHandleId(): string {
   handleCounter += 1;
   return `q3-${Date.now()}-${handleCounter}`;
+}
+
+/**
+ * Streaming path via Node's http.request, bypassing Bun's fetch.
+ *
+ * The fetch-based path hangs on streaming chunked responses from
+ * vllm-omni in the OpenCode plugin runtime (confirmed across v8/v9/v10
+ * diagnostics — fetch_start fires, no fetch_ok ever follows). The same
+ * fetch works in a bare Bun process and via curl, so the issue is
+ * specific to the runtime context, not the network or server.
+ *
+ * http.request gives us explicit chunk-level control: we attach a
+ * 'data' handler to the response IncomingMessage and write each chunk
+ * straight to the player's stdin as it arrives. No fetch lifecycle,
+ * no Response abstraction, no getReader().
+ *
+ * This is the low-TTFB path. The buffered path (stream=false) stays on
+ * fetch() because it works and there's no reason to change it.
+ */
+function streamViaHttpRequest(
+  endpointUrl: string,
+  bodyJson: string,
+  volume: number,
+  callId: string,
+  format: "wav" | "pcm",
+  timeoutMs: number,
+): {
+  stop: () => void;
+  done: Promise<void>;
+  fetchPromise: Promise<void>;
+} {
+  const playArgs =
+    format === "pcm"
+      ? [
+          "-v",
+          String(volume),
+          "-t",
+          "raw",
+          "-r",
+          String(PCM_SAMPLE_RATE_HZ),
+          "-e",
+          "signed",
+          "-b",
+          "16",
+          "-c",
+          "1",
+          "-",
+        ]
+      : ["-v", String(volume), "-t", "wav", "-"];
+  const child = spawn("play", playArgs, {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  trace("play_spawn", {
+    call_id: callId,
+    pid: child.pid,
+    format,
+    spawn_ms: 0,
+    mode: "http_request_stream",
+  });
+
+  child.stderr?.on("data", (data) => {
+    trace("play_stderr", { call_id: callId, line: data.toString().trim() });
+  });
+  child.on("error", (err) => {
+    trace("play_error", { call_id: callId, error: err.message });
+  });
+
+  const playbackDone = new Promise<void>((resolve) => {
+    child.on("exit", (code, signal) => {
+      trace("play_exit", { call_id: callId, code, signal });
+      resolve();
+    });
+    child.on("error", () => resolve());
+  });
+
+  const stdin = child.stdin!;
+  let cancelled = false;
+  let firstChunkAt: number | undefined;
+  let chunkCount = 0;
+  let totalBytes = 0;
+  const requestStart = Date.now();
+  let req: ReturnType<typeof httpRequest> | undefined;
+
+  const fetchPromise = new Promise<void>((resolve, reject) => {
+    let u: URL;
+    try {
+      u = new URL(endpointUrl);
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
+    trace("http_request_start", { call_id: callId, host: u.host, path: u.pathname });
+    req = httpRequest(
+      {
+        host: u.hostname,
+        port: u.port || 80,
+        path: u.pathname + u.search,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(bodyJson),
+          Accept: "*/*",
+        },
+      },
+      (res: IncomingMessage) => {
+        const headersAt = Date.now();
+        trace("http_response_headers", {
+          call_id: callId,
+          status: res.statusCode,
+          latency_ms: headersAt - requestStart,
+          content_type: res.headers["content-type"],
+          transfer_encoding: res.headers["transfer-encoding"],
+          content_length: res.headers["content-length"],
+        });
+
+        if (res.statusCode && res.statusCode >= 400) {
+          let body = "";
+          res.setEncoding("utf-8");
+          res.on("data", (c) => (body += c));
+          res.on("end", () => {
+            reject(
+              new Error(
+                `Qwen3-TTS endpoint error (${res.statusCode}): ${body || "no body"}`,
+              ),
+            );
+          });
+          return;
+        }
+
+        res.on("data", (chunk: Buffer) => {
+          if (cancelled) return;
+          if (firstChunkAt === undefined) {
+            firstChunkAt = Date.now();
+            trace("first_chunk", {
+              call_id: callId,
+              bytes: chunk.length,
+              after_headers_ms: firstChunkAt - headersAt,
+              after_request_ms: firstChunkAt - requestStart,
+            });
+          }
+          chunkCount += 1;
+          totalBytes += chunk.length;
+          if (!stdin.write(chunk)) {
+            res.pause();
+            stdin.once("drain", () => res.resume());
+          }
+        });
+        res.on("end", () => {
+          trace("stream_complete", {
+            call_id: callId,
+            chunks: chunkCount,
+            total_bytes: totalBytes,
+            duration_ms: Date.now() - requestStart,
+          });
+          try {
+            stdin.end();
+          } catch {
+            /* ignore */
+          }
+          resolve();
+        });
+        res.on("error", (err) => {
+          trace("stream_error", { call_id: callId, error: err.message });
+          try {
+            stdin.end();
+          } catch {
+            /* ignore */
+          }
+          reject(err);
+        });
+      },
+    );
+
+    req.setTimeout(timeoutMs, () => {
+      trace("http_request_timeout", { call_id: callId, timeout_ms: timeoutMs });
+      req?.destroy(new Error(`http.request timed out after ${timeoutMs}ms`));
+    });
+
+    req.on("error", (err) => {
+      trace("http_request_error", { call_id: callId, error: err.message });
+      try {
+        stdin.end();
+      } catch {
+        /* ignore */
+      }
+      reject(err);
+    });
+
+    req.write(bodyJson);
+    req.end();
+  });
+
+  const stop = () => {
+    cancelled = true;
+    try {
+      req?.destroy();
+    } catch {
+      /* ignore */
+    }
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      /* ignore */
+    }
+  };
+
+  return { stop, done: playbackDone, fetchPromise };
 }
 
 /**
@@ -395,25 +605,55 @@ export function createQwen3TtsProvider(config: Qwen3TtsConfig): TTSProvider {
       }
       if (config.agent !== undefined) body.user = config.agent;
 
+      const bodyJson = JSON.stringify(body);
+
+      // v11: streaming path uses Node's http.request directly, bypassing
+      // Bun's fetch. Diagnostics v8/v9/v10 showed that fetch() never
+      // resolves on streaming chunked responses from vllm-omni in the
+      // OpenCode plugin runtime, regardless of keepalive or arrayBuffer
+      // vs getReader(). The same fetch works in a bare Bun process, so
+      // the incompatibility is between the harness's fetch context and
+      // chunked-no-content-length responses. http.request gives us
+      // direct chunk handling and sidesteps the fetch lifecycle entirely.
+      if (stream) {
+        trace("http_request_dispatch", { call_id: callId, url: `${endpoint}/v1/audio/speech`, body_size: bodyJson.length });
+        const { stop, done, fetchPromise } = streamViaHttpRequest(
+          `${endpoint}/v1/audio/speech`,
+          bodyJson,
+          req.volume,
+          callId,
+          playerFormat,
+          timeoutMs,
+        );
+        fetchPromise.catch((err) => {
+          trace("http_request_failed", { call_id: callId, error: (err as Error).message });
+        });
+        done
+          .then(() => trace("playback_done", { call_id: callId }))
+          .catch((e) => trace("playback_error", { call_id: callId, error: String(e) }));
+        return {
+          id: nextHandleId(),
+          startedAt: Date.now(),
+          stop,
+          done,
+        };
+      }
+
+      // Buffered (non-streaming) path retains the fetch implementation —
+      // it works in the plugin runtime and there is no reason to change
+      // a working transport.
       const controller = new AbortController();
       const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
 
       let response: Response;
       const fetchStart = Date.now();
-      trace("fetch_start", { call_id: callId, url: `${endpoint}/v1/audio/speech`, body_size: JSON.stringify(body).length });
+      trace("fetch_start", { call_id: callId, url: `${endpoint}/v1/audio/speech`, body_size: bodyJson.length });
       try {
         response = await fetch(`${endpoint}/v1/audio/speech`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
+          body: bodyJson,
           signal: controller.signal,
-          // v10: force a fresh connection per request. Earlier diagnostic
-          // (v9) showed that fetch() never resolves on streaming chunked
-          // responses from vllm-omni in the plugin runtime context, while
-          // the same fetch works from a bare Bun process. Hypothesis: a
-          // pooled keepalive connection holds state that breaks subsequent
-          // chunked-response handling.
-          keepalive: false,
         });
       } catch (err) {
         clearTimeout(timeoutHandle);
@@ -449,48 +689,6 @@ export function createQwen3TtsProvider(config: Qwen3TtsConfig): TTSProvider {
         transfer_encoding: response.headers.get("transfer-encoding"),
         content_length: response.headers.get("content-length"),
       });
-
-      // v9 diagnostic: when streaming is requested, read the full body via
-      // arrayBuffer() before feeding the player. Two questions answered at
-      // once:
-      //   1. Does fetch complete on the streaming path (vs hanging in
-      //      getReader())? The hang under investigation manifested as
-      //      missing fetch_ok events when getReader() was used.
-      //   2. Does a single stdin.write() of the whole buffer sound clean
-      //      (vs the chunked-write distortion observed on the buffered
-      //      path)?
-      if (stream) {
-        const abStart = Date.now();
-        trace("arraybuffer_start", { call_id: callId });
-        let bytes: Uint8Array;
-        try {
-          const buf = await response.arrayBuffer();
-          bytes = new Uint8Array(buf);
-          trace("arraybuffer_done", {
-            call_id: callId,
-            bytes: bytes.length,
-            duration_ms: Date.now() - abStart,
-          });
-        } catch (err) {
-          trace("arraybuffer_error", {
-            call_id: callId,
-            error: (err as Error).message,
-            duration_ms: Date.now() - abStart,
-          });
-          throw err;
-        }
-
-        const { stop, done } = playBufferOnce(bytes, req.volume, callId, playerFormat);
-        done
-          .then(() => trace("playback_done", { call_id: callId }))
-          .catch((e) => trace("playback_error", { call_id: callId, error: String(e) }));
-        return {
-          id: nextHandleId(),
-          startedAt: Date.now(),
-          stop,
-          done,
-        };
-      }
 
       const { stop, done } = streamAudioToPlayer(response.body, req.volume, callId, playerFormat);
 
