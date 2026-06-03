@@ -109,7 +109,7 @@ const DEFAULT_TIMEOUT_MS = 90_000;
 const DEFAULT_MODEL = "/model";
 const DEFAULT_STREAM = true;
 const PCM_SAMPLE_RATE_HZ = 24_000;
-const PROVIDER_BUILD = "2026-06-03-v8-streaming-pcm";
+const PROVIDER_BUILD = "2026-06-03-v9-streaming-arraybuffer-diag";
 
 // Side-channel observability: write a sentinel file at module load so we can
 // verify *outside the log* which build OpenCode actually picked up. This file
@@ -257,6 +257,84 @@ function streamAudioToPlayer(
   return { stop, done };
 }
 
+/**
+ * Diagnostic helper: spawn `play` with the right input format and write
+ * a single complete buffer to stdin, then close it. Used by the v9
+ * diagnostic to remove chunked-stdin-write as a confound for audio
+ * quality on the streaming path.
+ *
+ * Independent of the chunked streaming path in streamAudioToPlayer.
+ */
+function playBufferOnce(
+  bytes: Uint8Array,
+  volume: number,
+  callId: string,
+  format: "wav" | "pcm",
+): { stop: () => void; done: Promise<void> } {
+  const spawnStart = Date.now();
+  const playArgs =
+    format === "pcm"
+      ? [
+          "-v",
+          String(volume),
+          "-t",
+          "raw",
+          "-r",
+          String(PCM_SAMPLE_RATE_HZ),
+          "-e",
+          "signed",
+          "-b",
+          "16",
+          "-c",
+          "1",
+          "-",
+        ]
+      : ["-v", String(volume), "-t", "wav", "-"];
+  const child = spawn("play", playArgs, {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  trace("play_spawn", {
+    call_id: callId,
+    pid: child.pid,
+    format,
+    spawn_ms: Date.now() - spawnStart,
+    mode: "buffer_once",
+    total_bytes: bytes.length,
+  });
+
+  child.stderr?.on("data", (data) => {
+    trace("play_stderr", { call_id: callId, line: data.toString().trim() });
+  });
+  child.on("error", (err) => {
+    trace("play_error", { call_id: callId, error: err.message });
+  });
+  child.on("exit", (code, signal) => {
+    trace("play_exit", { call_id: callId, code, signal, duration_ms: Date.now() - spawnStart });
+  });
+
+  const done = new Promise<void>((resolve) => {
+    child.on("exit", () => resolve());
+    child.on("error", () => resolve());
+  });
+
+  try {
+    child.stdin!.write(bytes);
+    child.stdin!.end();
+  } catch (err) {
+    trace("play_stdin_error", { call_id: callId, error: (err as Error).message });
+  }
+
+  const stop = () => {
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      /* ignore */
+    }
+  };
+
+  return { stop, done };
+}
+
 export function createQwen3TtsProvider(config: Qwen3TtsConfig): TTSProvider {
   const endpoint = config.endpoint.replace(/\/+$/, "");
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -364,6 +442,48 @@ export function createQwen3TtsProvider(config: Qwen3TtsConfig): TTSProvider {
         transfer_encoding: response.headers.get("transfer-encoding"),
         content_length: response.headers.get("content-length"),
       });
+
+      // v9 diagnostic: when streaming is requested, read the full body via
+      // arrayBuffer() before feeding the player. Two questions answered at
+      // once:
+      //   1. Does fetch complete on the streaming path (vs hanging in
+      //      getReader())? The hang under investigation manifested as
+      //      missing fetch_ok events when getReader() was used.
+      //   2. Does a single stdin.write() of the whole buffer sound clean
+      //      (vs the chunked-write distortion observed on the buffered
+      //      path)?
+      if (stream) {
+        const abStart = Date.now();
+        trace("arraybuffer_start", { call_id: callId });
+        let bytes: Uint8Array;
+        try {
+          const buf = await response.arrayBuffer();
+          bytes = new Uint8Array(buf);
+          trace("arraybuffer_done", {
+            call_id: callId,
+            bytes: bytes.length,
+            duration_ms: Date.now() - abStart,
+          });
+        } catch (err) {
+          trace("arraybuffer_error", {
+            call_id: callId,
+            error: (err as Error).message,
+            duration_ms: Date.now() - abStart,
+          });
+          throw err;
+        }
+
+        const { stop, done } = playBufferOnce(bytes, req.volume, callId, playerFormat);
+        done
+          .then(() => trace("playback_done", { call_id: callId }))
+          .catch((e) => trace("playback_error", { call_id: callId, error: String(e) }));
+        return {
+          id: nextHandleId(),
+          startedAt: Date.now(),
+          stop,
+          done,
+        };
+      }
 
       const { stop, done } = streamAudioToPlayer(response.body, req.volume, callId, playerFormat);
 
