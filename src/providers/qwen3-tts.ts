@@ -109,7 +109,7 @@ const DEFAULT_TIMEOUT_MS = 90_000;
 const DEFAULT_MODEL = "/model";
 const DEFAULT_STREAM = true;
 const PCM_SAMPLE_RATE_HZ = 24_000;
-const PROVIDER_BUILD = "2026-06-03-v9-streaming-arraybuffer-diag";
+const PROVIDER_BUILD = "2026-06-03-v10-streaming-no-keepalive";
 
 // Side-channel observability: write a sentinel file at module load so we can
 // verify *outside the log* which build OpenCode actually picked up. This file
@@ -407,6 +407,13 @@ export function createQwen3TtsProvider(config: Qwen3TtsConfig): TTSProvider {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
           signal: controller.signal,
+          // v10: force a fresh connection per request. Earlier diagnostic
+          // (v9) showed that fetch() never resolves on streaming chunked
+          // responses from vllm-omni in the plugin runtime context, while
+          // the same fetch works from a bare Bun process. Hypothesis: a
+          // pooled keepalive connection holds state that breaks subsequent
+          // chunked-response handling.
+          keepalive: false,
         });
       } catch (err) {
         clearTimeout(timeoutHandle);
