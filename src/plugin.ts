@@ -3,6 +3,13 @@ import { readFileSync, existsSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import { createProvider, type ProviderName, type TTSProvider } from "./providers/index.js";
+import { chunkForTTS } from "./chunker.js";
+import {
+  PlaybackQueue,
+  DEFAULT_SPEAK_MODE,
+  type SpeakMode,
+} from "./playback-queue.js";
+import { extractSpeakBlocks as extractTaggedSpeech } from "./speak-tags.js";
 
 /**
  * Default constants
@@ -105,23 +112,47 @@ export interface VoiceConfig {
    *   "Calm and professional."
    *   "Slow, contemplative, whispered."
    */
-  qwen3TtsInstruct?: string;
+   qwen3TtsInstruct?: string;
+  /**
+   * Language hint for the qwen3-tts vllm-omni server. Pinned per
+   * request to stabilize accent across French/English code-switching.
+   *
+   * Accepted values: "Auto", "English", "French", "Chinese",
+   * "Japanese", "Korean", "German", "Russian", "Portuguese",
+   * "Spanish", "Italian". Defaults to omitted (server default).
+   */
+  qwen3TtsLanguage?: string;
+  /**
+   * When true, request streaming PCM output from the vllm-omni server
+   * (response_format=pcm + stream=true) and pipe directly into the
+   * player as raw 24kHz 16-bit signed mono. Defaults to true on the
+   * v0.22+ streaming server; set false to fall back to the older WAV
+   * response shape (e.g. for an older non-streaming backend).
+   */
+  qwen3TtsStream?: boolean;
 
   // --- Shared ---
   enabled?: boolean | "on" | "off" | "default";
   /**
    * Speech mode:
-   *   "tagged" (default) — only speak content wrapped in <speak>...</speak> tags
-   *   "all"              — speak everything except content wrapped in <no-speak>...</no-speak> tags
+   *   "tagged" (default) — only speak content wrapped in <speak>...</speak>;
+   *                        the tags themselves are stripped from display.
+   *   "tagged-raw"       — same speech selection as "tagged", but the raw
+   *                        <speak>...</speak> tags are preserved in the
+   *                        displayed transcript. Useful when you need to
+   *                        see exactly what the model emitted (e.g. to
+   *                        diagnose models that mis-emit tag syntax).
+   *   "all"              — speak everything except content wrapped in
+   *                        <no-speak>...</no-speak> tags
    */
-  speakMode?: "tagged" | "all";
+  speakMode?: "tagged" | "tagged-raw" | "all";
   speed?: number;
   volume?: number;
 }
 
 interface VoiceState {
   enabled?: boolean;
-  speakMode?: "tagged" | "all";
+  speakMode?: "tagged" | "tagged-raw" | "all";
 }
 
 function resolveEnabled(value: VoiceConfig["enabled"] | undefined): boolean {
@@ -143,33 +174,11 @@ function writeJsonFile(filePath: string, value: unknown): void {
   writeFileSync(filePath, JSON.stringify(value, null, 2) + "\n", "utf-8");
 }
 
-function extractSpeakBlocks(text: string): { cleanText: string; spokenText: string } {
-  const spoken: string[] = [];
-
-  // Match <speak>...</speak> blocks. If the closing tag is missing, fall back
-  // to the next paragraph boundary (blank line) or end of input. This makes
-  // the markup forgiving of a common author mistake — opening a speak block
-  // and then drifting on without closing it. The implicit close at \n\n
-  // preserves the natural unit of speech (one paragraph) without
-  // accidentally vocalizing subsequent technical content.
-  const cleanText = text.replace(
-    /<speak>([\s\S]*?)(?:<\/speak>|\n\n|$)/gi,
-    (_match, inner) => {
-      const trimmed = String(inner).trim();
-      if (trimmed) spoken.push(trimmed);
-      return trimmed;
-    },
-  );
-  return {
-    cleanText,
-    spokenText: spoken.join("\n"),
-  };
-}
-
 /**
  * In "all" mode: strip <no-speak> blocks from both the spoken text and
  * remove the tags from the displayed text. Everything outside <no-speak>
- * tags is spoken.
+ * tags is spoken as one logical utterance (default mode "replace": a new
+ * turn cancels and replaces any in-flight playback from a prior turn).
  */
 function extractAllModeText(text: string): { cleanText: string; spokenText: string } {
   const spokenText = text
@@ -294,10 +303,12 @@ export const VoicePlugin: Plugin = async (input, options) => {
       agentConfig?.qwen3TtsAgent ??
       process.env.AGENT_NAME?.toLowerCase(),
     qwen3TtsInstruct: voiceOptions?.qwen3TtsInstruct ?? agentConfig?.qwen3TtsInstruct,
+    qwen3TtsLanguage: voiceOptions?.qwen3TtsLanguage ?? agentConfig?.qwen3TtsLanguage,
+    qwen3TtsStream: voiceOptions?.qwen3TtsStream ?? agentConfig?.qwen3TtsStream,
     // Runtime / shared
     enabled: runtimeState?.enabled ?? resolveEnabled(configuredEnabled),
     configuredEnabled,
-    speakMode: (runtimeState?.speakMode ?? voiceOptions?.speakMode ?? agentConfig?.speakMode ?? "tagged") as "tagged" | "all",
+    speakMode: (runtimeState?.speakMode ?? voiceOptions?.speakMode ?? agentConfig?.speakMode ?? "tagged") as "tagged" | "tagged-raw" | "all",
     speed: voiceOptions?.speed ?? agentConfig?.speed ?? 1.0,
     volume: voiceOptions?.volume ?? agentConfig?.volume ?? 1.0,
   };
@@ -321,6 +332,8 @@ export const VoicePlugin: Plugin = async (input, options) => {
         model: config.qwen3TtsModel,
         agent: config.qwen3TtsAgent,
         instruct: config.qwen3TtsInstruct,
+        language: config.qwen3TtsLanguage,
+        stream: config.qwen3TtsStream,
       });
     }
     return createProvider("elevenlabs", {
@@ -337,16 +350,41 @@ export const VoicePlugin: Plugin = async (input, options) => {
 
   const provider: TTSProvider = buildProvider();
 
+  // Single playback coordinator for the lifetime of this plugin instance.
+  // Every speak call (tool, tagged extraction, all-mode turn) routes through
+  // it. This is what enforces the modality contract:
+  //   - "replace" (default for whole-turn voice in all-mode, and the most
+  //     common modality for conversational use) stops any in-flight playback
+  //     before starting the new one, eliminating the double-play we used to
+  //     see when turns came back-to-back.
+  //   - "queue" appends behind in-flight playback. Useful for multi-segment
+  //     narration where pause-then-continue is intentional.
+  //   - "interrupt" is currently identical to "replace" but named distinctly
+  //     so a future implementation can diverge (e.g., explicit barge-in
+  //     semantics with a notification ping).
+  const playbackQueue = new PlaybackQueue(provider);
+
   /**
    * Internal helper that drives a request through the provider and returns
    * a confirmation string in the same shape startSpeech() used to return.
    * Errors are surfaced to the caller; the provider's playback runs
    * non-blocking via its returned handle.
+   *
+   * If the post-normalization text exceeds the provider's safe input
+   * ceiling, it is chunked at sentence boundaries before submission.
+   * Chunks are played sequentially regardless of the caller's chosen
+   * modality — modality controls how this *call* relates to prior calls,
+   * not how chunks within one call relate to each other.
+   *
+   * The first chunk respects the caller's modality (replace/queue/interrupt).
+   * Subsequent chunks are submitted in queue mode so they play back-to-back
+   * without interruption.
    */
   async function speakViaProvider(args: {
     text: string;
     volume: number;
     speed?: number;
+    mode?: SpeakMode;
     opts?: Record<string, unknown>;
   }): Promise<string> {
     // Strip markdown/structural syntax that shouldn't be vocalized.
@@ -359,19 +397,54 @@ No speakable content after normalization.
 </speak_skipped>`;
     }
 
-    const handle = await provider.speak({
-      text: speechText,
-      volume: args.volume,
-      speed: args.speed,
-      opts: args.opts,
-    });
+    const chunks = chunkForTTS(speechText);
+    if (chunks.length === 0) {
+      return `<speak_skipped>
+Chunker produced no output.
+</speak_skipped>`;
+    }
+
+    const firstMode = args.mode ?? DEFAULT_SPEAK_MODE;
+    const firstHandle = await playbackQueue.speak(
+      {
+        text: chunks[0],
+        volume: args.volume,
+        speed: args.speed,
+        opts: args.opts,
+      },
+      firstMode,
+    );
+
+    // Queue any remaining chunks behind the first one. They inherit
+    // the same volume / speed / opts and always play in "queue" mode
+    // so the multi-chunk utterance plays as one continuous arc.
+    for (let i = 1; i < chunks.length; i += 1) {
+      void playbackQueue
+        .speak(
+          {
+            text: chunks[i],
+            volume: args.volume,
+            speed: args.speed,
+            opts: args.opts,
+          },
+          "queue",
+        )
+        .catch((err) => {
+          console.error(
+            `[opencode-voice] chunk ${i + 1}/${chunks.length} failed:`,
+            err,
+          );
+        });
+    }
 
     const preview =
       speechText.length > 80 ? speechText.substring(0, 80) + "..." : speechText;
     return `<speak_started>
 Playing speech (non-blocking): "${preview}"
 Provider: ${provider.name}
-Handle: ${handle.id}
+Handle: ${firstHandle.id}
+Mode: ${firstMode}
+Chunks: ${chunks.length}
 </speak_started>`;
   }
 
@@ -426,6 +499,13 @@ USAGE GUIDANCE:
           "Supported by qwen3-tts only; ignored by other providers. " +
           "Examples: 'Whispered, intimate.' / 'Excited, animated.' / 'Calm and slow.'"
         ),
+      mode: tool.schema.enum(["replace", "queue", "interrupt"]).optional()
+        .describe(
+          "Speak modality (default \"replace\"). " +
+          "\"replace\": stop any in-flight playback before starting this one (best for conversational turns). " +
+          "\"queue\": wait for current playback to finish before starting (best for multi-segment narration). " +
+          "\"interrupt\": alias of \"replace\" with explicit barge-in intent."
+        ),
     },
 
     async execute(args) {
@@ -439,6 +519,7 @@ USAGE GUIDANCE:
         use_speaker_boost,
         preserveVoiceDefaults,
         instruct,
+        mode,
         speed = config.speed,
         volume = config.volume,
       } = args;
@@ -459,6 +540,7 @@ USAGE GUIDANCE:
         text,
         volume,
         speed,
+        mode: mode as SpeakMode | undefined,
         opts: Object.keys(opts).length ? opts : undefined,
       });
     },
@@ -470,10 +552,11 @@ USAGE GUIDANCE:
 - on: enable speaking of <speak>...</speak> blocks (tagged mode)
 - off: disable speaking entirely
 - status: show current voice mode and config
-- tagged: switch to tagged mode — only speak content inside <speak>...</speak> tags
+- tagged: switch to tagged mode — only speak content inside <speak>...</speak> tags (tags stripped from display)
+- tagged-raw: same speech selection as tagged, but preserve raw <speak> tags in the displayed transcript (useful for diagnosing model tag-fidelity issues)
 - all: switch to all mode — speak everything except content inside <no-speak>...</no-speak> tags`,
     args: {
-      action: tool.schema.enum(["on", "off", "status", "tagged", "all"]).describe("Voice mode action to perform."),
+      action: tool.schema.enum(["on", "off", "status", "tagged", "tagged-raw", "all"]).describe("Voice mode action to perform."),
     },
     async execute(args) {
       const action = args.action;
@@ -498,7 +581,7 @@ USAGE GUIDANCE:
         throw new Error("Voice runtime state is unavailable because the agent directory is missing.");
       }
 
-      if (action === "tagged" || action === "all") {
+      if (action === "tagged" || action === "tagged-raw" || action === "all") {
         config.speakMode = action;
         config.enabled = true;
         writeJsonFile(statePath, { enabled: true, speakMode: action });
@@ -516,18 +599,67 @@ USAGE GUIDANCE:
     tool: { speak: speakTool, voice: voiceTool },
     "experimental.text.complete": async (_input, output) => {
       if (!config.enabled) return;
-      const { cleanText, spokenText } = config.speakMode === "all"
-        ? extractAllModeText(output.text)
-        : extractSpeakBlocks(output.text);
-      output.text = cleanText;
-      if (!spokenText) return;
-      void speakViaProvider({
-        text: spokenText,
-        volume: config.volume,
-        speed: config.speed,
-      }).catch((error) => {
-        console.error("[opencode-voice] tagged speak failed:", error);
-      });
+
+      if (config.speakMode === "all") {
+        // In all-mode, the entire turn is one logical utterance.
+        // Default modality is "replace" so a fresh turn cancels any
+        // lingering playback from a prior turn — eliminates double-play
+        // when turns arrive back-to-back during conversation.
+        const { cleanText, spokenText } = extractAllModeText(output.text);
+        output.text = cleanText;
+        if (!spokenText) return;
+        void speakViaProvider({
+          text: spokenText,
+          volume: config.volume,
+          speed: config.speed,
+          mode: "replace",
+        }).catch((error) => {
+          console.error("[opencode-voice] all-mode speak failed:", error);
+        });
+        return;
+      }
+
+      // Tagged mode (and tagged-raw): extract each <speak> block in
+      // document order, preserving its parsed `mode` attribute (or
+      // undefined if none was declared). Default resolution rules:
+      //   - First block of a turn: default "replace" — fresh turn
+      //     cancels any lingering playback from the prior turn.
+      //   - Subsequent blocks within the same turn: default "queue"
+      //     — multiple tags in one model response narrate in sequence
+      //     rather than cancelling each other.
+      // Authors who want a later block to interrupt earlier ones in
+      // the same turn write mode="replace" or mode="interrupt"
+      // explicitly.
+      //
+      // Display behavior differs by mode:
+      //   - "tagged":     output.text rewritten to cleanText (tags stripped)
+      //   - "tagged-raw": output.text untouched (raw tags preserved in
+      //                   the transcript so you can see exactly what the
+      //                   model emitted — useful for diagnosing models
+      //                   that mis-emit tag syntax)
+      const { cleanText, blocks } = extractTaggedSpeech(output.text);
+      if (config.speakMode === "tagged") {
+        output.text = cleanText;
+      }
+      if (!blocks.length) return;
+
+      for (let i = 0; i < blocks.length; i += 1) {
+        const block = blocks[i];
+        const isFirst = i === 0;
+        const resolvedMode: SpeakMode =
+          block.mode ?? (isFirst ? DEFAULT_SPEAK_MODE : "queue");
+        void speakViaProvider({
+          text: block.text,
+          volume: config.volume,
+          speed: config.speed,
+          mode: resolvedMode,
+        }).catch((error) => {
+          console.error(
+            `[opencode-voice] tagged speak block ${i + 1}/${blocks.length} failed:`,
+            error,
+          );
+        });
+      }
     },
   };
 };
