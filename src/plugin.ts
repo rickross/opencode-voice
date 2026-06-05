@@ -285,8 +285,12 @@ function normalizeForSpeech(text: string): string {
   out = out.replace(/__([^_]+)__/g, "$1");
   out = out.replace(/_([^_\n]+)_/g, "$1");
 
-  // Stray asterisks or underscores that didn't form a pair.
-  out = out.replace(/[*_]/g, "");
+  // Stray asterisks that didn't form a pair. Underscores are NOT
+  // stripped here: bare underscores in plain prose are almost always
+  // legitimate (snake_case identifiers, file_names, config keys),
+  // not leftover markdown. The earlier paired-underscore patterns
+  // already handle the actual italic/bold markdown cases.
+  out = out.replace(/\*/g, "");
 
   // Leading list/heading markers at start of lines.
   out = out.replace(/^[ \t]{0,3}#{1,6}[ \t]+/gm, "");
