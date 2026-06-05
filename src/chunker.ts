@@ -131,13 +131,28 @@ function packSentencesIntoChunks(
 /**
  * Split text into TTS-ready chunks.
  *
- * The shape: split first on paragraph boundaries (\n\n), then within
- * each paragraph on sentence boundaries, then pack sentences greedily
- * into chunks of up to maxChars. Paragraph breaks are honored as
- * hard splits so prosodic pauses align with the writer's structure.
+ * The shape: split first on paragraph boundaries (\n\n) — always,
+ * regardless of total input length. Then within each paragraph,
+ * split on sentence boundaries and pack sentences greedily into
+ * chunks of up to maxChars.
  *
- * Short inputs (<= maxChars after trimming) are returned as a single
- * chunk with no splitting work performed.
+ * Why paragraph-split is unconditional: empirically, the Higgs
+ * Audio v3 model interprets internal blank lines (\n\n) as "text
+ * is done" and emits silence-tokens for the remainder of its token
+ * budget — producing a long file containing only the first
+ * paragraph of speech followed by ~60 seconds of near-silence.
+ * Qwen3-TTS handles paragraph breaks more gracefully but still
+ * benefits from explicit splitting (cleaner prosody, no risk of
+ * the chunker swallowing structural breaks the writer intended).
+ *
+ * So: never send a chunk containing an internal `\n\n` to any
+ * provider. Each paragraph becomes its own chunk; chunks play
+ * back-to-back; paragraph breaks become natural pauses between
+ * audio segments rather than confused-model failure modes.
+ *
+ * Single-paragraph inputs short enough to fit in one chunk are
+ * still returned as a single-element array (no per-sentence
+ * packing needed).
  */
 export function chunkForTTS(text: string, opts: ChunkOptions = {}): string[] {
   const maxChars = opts.maxChars ?? DEFAULT_MAX_CHARS;
@@ -145,15 +160,20 @@ export function chunkForTTS(text: string, opts: ChunkOptions = {}): string[] {
 
   const trimmed = text.trim();
   if (!trimmed) return [];
-  if (trimmed.length <= maxChars) return [trimmed];
 
-  // Paragraph-level split first. Each paragraph becomes its own
-  // sentence-packing problem, and chunks never cross paragraph
-  // boundaries.
+  // Always split on paragraph boundaries first, regardless of total
+  // length. This is the fix for the Higgs-paragraph-silence bug:
+  // never let a chunk contain an internal `\n\n`.
   const paragraphs = trimmed
     .split(/\n{2,}/)
     .map((p) => p.trim())
     .filter((p) => p.length > 0);
+
+  // Fast path: single paragraph that fits in one chunk. No further
+  // splitting work needed.
+  if (paragraphs.length === 1 && paragraphs[0].length <= maxChars) {
+    return [paragraphs[0]];
+  }
 
   const chunks: string[] = [];
   for (const paragraph of paragraphs) {
