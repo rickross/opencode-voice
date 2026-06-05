@@ -198,7 +198,7 @@ sound.
 | `referenceCodes`  | array of int arrays | Pre-loaded 8-codebook codes (bypasses voice-key lookup)         |
 | `temperature`     | float               | Sampling temperature (provider default 0.8; server default 1.0) |
 | `topK`            | int                 | Top-k sampling (provider default 50; server default null)       |
-| `maxNewTokens`    | int                 | Max codec steps (provider default 1024; server default 2048)    |
+| `maxNewTokens`    | int                 | Max codec steps (provider default 4096; server default 2048)    |
 | `responseFormat`  | "wav" \| "mp3"      | Output audio format (provider default wav)                      |
 
 `speed` from `TTSRequest` is honored at the request level. Inline
@@ -207,9 +207,12 @@ sound.
 **Note on defaults:** This provider overrides three SGLang-Omni server
 defaults intentionally: temperature 0.8 (vs server 1.0) for slightly
 more deterministic delivery; top_k 50 (vs server null) for the
-conventional Higgs setting; max_new_tokens 1024 (vs server 2048) to
-cap unbounded generation. Override per-request via the opts fields
-when you need different behavior.
+conventional Higgs setting; max_new_tokens 4096 (vs server 2048) to
+allow ~90 seconds of audio per chunk (the previous 1024 default
+truncated audio at ~25 seconds, biting conversational responses
+that the chunker correctly kept under its char limit but that ran
+longer than 25s when spoken). Override per-request via the opts
+fields when you need different behavior.
 
 **SGLang-Omni response formats supported by the server:** wav (default),
 mp3, flac, opus, aac, pcm. This provider supports:
@@ -268,7 +271,7 @@ For cadre voice via live reference (recommended; streaming PCM):
   "agent": "solene",
   "temperature": 0.8,
   "topK": 50,
-  "maxNewTokens": 1024,
+  "maxNewTokens": 4096,
   "stream": true
 }
 ```

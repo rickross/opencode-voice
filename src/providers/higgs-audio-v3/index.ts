@@ -173,7 +173,7 @@ export interface HiggsAudioV3RequestOpts {
 const DEFAULT_TIMEOUT_MS = 90_000;
 const DEFAULT_TEMPERATURE = 0.8;
 const DEFAULT_TOP_K = 50;
-const DEFAULT_MAX_NEW_TOKENS = 1024;
+const DEFAULT_MAX_NEW_TOKENS = 4096;
 const DEFAULT_RESPONSE_FORMAT = "wav" as const;
 const DEFAULT_STREAM = false;
 const PCM_SAMPLE_RATE_HZ = 24_000;
