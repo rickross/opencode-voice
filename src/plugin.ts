@@ -558,16 +558,32 @@ USAGE GUIDANCE:
   });
 
   const voiceTool = tool({
-    description: `Control runtime voice mode for tag-driven speech.
+    description: `Control runtime voice mode for tag-driven speech, and manage TTS providers.
 
+Voice mode actions:
 - on: enable speaking of <speak>...</speak> blocks (tagged mode)
 - off: disable speaking entirely
-- status: show current voice mode and config
+- status: show current voice mode, active provider, and available providers
 - tagged: switch to tagged mode — only speak content inside <speak>...</speak> tags (tags stripped from display)
 - tagged-raw: same speech selection as tagged, but preserve raw <speak> tags in the displayed transcript (useful for diagnosing model tag-fidelity issues)
-- all: switch to all mode — speak everything except content inside <no-speak>...</no-speak> tags`,
+- all: switch to all mode — speak everything except content inside <no-speak>...</no-speak> tags
+
+Provider actions:
+- list: list available TTS providers with active marker and one-line summaries
+- describe: dump the full CAPABILITIES.md for one provider — pass providerName
+- switch: swap the active TTS provider — pass providerName`,
     args: {
-      action: tool.schema.enum(["on", "off", "status", "tagged", "tagged-raw", "all"]).describe("Voice mode action to perform."),
+      action: tool.schema
+        .enum([
+          "on", "off", "status",
+          "tagged", "tagged-raw", "all",
+          "list", "describe", "switch",
+        ])
+        .describe("Voice mode or provider action to perform."),
+      providerName: tool.schema
+        .string()
+        .optional()
+        .describe("Provider name for describe/switch actions (e.g. 'qwen3-tts', 'higgs-audio-v3')."),
     },
     async execute(args) {
       const action = args.action;
@@ -587,6 +603,31 @@ USAGE GUIDANCE:
           null,
           2,
         );
+      }
+
+      if (action === "list") {
+        const summaries = registry.listSummaries();
+        const lines = summaries.map((s) => {
+          const marker = s.active ? "* " : "  ";
+          return `${marker}${s.name} — ${s.summary}`;
+        });
+        return lines.join("\n");
+      }
+
+      if (action === "describe") {
+        if (!args.providerName) {
+          throw new Error("providerName is required for the 'describe' action.");
+        }
+        return registry.describe(args.providerName as ProviderName);
+      }
+
+      if (action === "switch") {
+        if (!args.providerName) {
+          throw new Error("providerName is required for the 'switch' action.");
+        }
+        const previous = registry.getActiveName();
+        registry.setActive(args.providerName as ProviderName);
+        return `Active TTS provider: ${previous} → ${registry.getActiveName()}.`;
       }
 
       if (!statePath) {
