@@ -1,4 +1,5 @@
 import { createElevenLabsProvider } from "./elevenlabs/index.js";
+import { createHiggsAudioV3Provider } from "./higgs-audio-v3/index.js";
 import { createOmniVoiceProvider } from "./omnivoice/index.js";
 import { createQwen3TtsProvider } from "./qwen3-tts/index.js";
 import type { TTSProvider } from "./types.js";
@@ -36,6 +37,17 @@ export interface ProviderConfigs {
     language?: string;
     stream?: boolean;
   };
+  "higgs-audio-v3": {
+    endpoint: string;
+    timeoutMs?: number;
+    voice?: string;
+    agent?: string;
+    temperature?: number;
+    topK?: number;
+    maxNewTokens?: number;
+    responseFormat?: "wav" | "mp3";
+    stream?: boolean;
+  };
 }
 
 export type ProviderName = keyof ProviderConfigs;
@@ -59,6 +71,9 @@ export function createProvider<P extends ProviderName>(
   }
   if (name === "qwen3-tts") {
     return createQwen3TtsProvider(config as ProviderConfigs["qwen3-tts"]);
+  }
+  if (name === "higgs-audio-v3") {
+    return createHiggsAudioV3Provider(config as ProviderConfigs["higgs-audio-v3"]);
   }
   throw new Error(`Unknown TTS provider: ${String(name)}`);
 }

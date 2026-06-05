@@ -26,6 +26,7 @@ const DEFAULT_API_KEY_PATH = join(
 const DEFAULT_OMNIVOICE_ENDPOINT = "http://127.0.0.1:7345";
 const DEFAULT_QWEN3_TTS_ENDPOINT = "http://zion.irelate.ai:5009";
 const DEFAULT_QWEN3_TTS_MODEL = "/model";
+const DEFAULT_HIGGS_ENDPOINT = "http://zion.irelate.ai:5012";
 const CONFIG_FILE = "voice.json";
 const STATE_FILE = "voice-state.json";
 
@@ -130,7 +131,36 @@ export interface VoiceConfig {
    * v0.22+ streaming server; set false to fall back to the older WAV
    * response shape (e.g. for an older non-streaming backend).
    */
-  qwen3TtsStream?: boolean;
+   qwen3TtsStream?: boolean;
+
+  // --- Higgs Audio v3 fields ---
+  /**
+   * Higgs Audio v3 endpoint, e.g. "http://zion.irelate.ai:5012".
+   * Defaults to http://zion.irelate.ai:5012 when provider is
+   * "higgs-audio-v3".
+   */
+  higgsEndpoint?: string;
+  /** Per-request timeout when calling the Higgs endpoint (ms). */
+  higgsTimeoutMs?: number;
+  /**
+   * Server-side voice key (e.g. "solene", "aurora"). Resolves to a
+   * precomputed codes file on the server side. Defaults to the
+   * lowercased AGENT_NAME from environment if not specified.
+   */
+  higgsVoice?: string;
+  /**
+   * Diagnostic caller id sent with every Higgs request for server-side
+   * log correlation. Defaults to the lowercased AGENT_NAME.
+   */
+  higgsAgent?: string;
+  /** Sampling temperature for Higgs (default 0.8). */
+  higgsTemperature?: number;
+  /** Top-k sampling for Higgs (default 50). */
+  higgsTopK?: number;
+  /** Max generation tokens for Higgs (default 1024). */
+  higgsMaxNewTokens?: number;
+  /** Response audio format: "wav" (default) or "mp3". */
+  higgsResponseFormat?: "wav" | "mp3";
 
   // --- Shared ---
   enabled?: boolean | "on" | "off" | "default";
@@ -306,6 +336,21 @@ export const VoicePlugin: Plugin = async (input, options) => {
     qwen3TtsInstruct: voiceOptions?.qwen3TtsInstruct ?? agentConfig?.qwen3TtsInstruct,
     qwen3TtsLanguage: voiceOptions?.qwen3TtsLanguage ?? agentConfig?.qwen3TtsLanguage,
     qwen3TtsStream: voiceOptions?.qwen3TtsStream ?? agentConfig?.qwen3TtsStream,
+    // Higgs Audio v3 config
+    higgsEndpoint: voiceOptions?.higgsEndpoint ?? agentConfig?.higgsEndpoint ?? DEFAULT_HIGGS_ENDPOINT,
+    higgsTimeoutMs: voiceOptions?.higgsTimeoutMs ?? agentConfig?.higgsTimeoutMs,
+    higgsVoice:
+      voiceOptions?.higgsVoice ??
+      agentConfig?.higgsVoice ??
+      process.env.AGENT_NAME?.toLowerCase(),
+    higgsAgent:
+      voiceOptions?.higgsAgent ??
+      agentConfig?.higgsAgent ??
+      process.env.AGENT_NAME?.toLowerCase(),
+    higgsTemperature: voiceOptions?.higgsTemperature ?? agentConfig?.higgsTemperature,
+    higgsTopK: voiceOptions?.higgsTopK ?? agentConfig?.higgsTopK,
+    higgsMaxNewTokens: voiceOptions?.higgsMaxNewTokens ?? agentConfig?.higgsMaxNewTokens,
+    higgsResponseFormat: voiceOptions?.higgsResponseFormat ?? agentConfig?.higgsResponseFormat,
     // Runtime / shared
     enabled: runtimeState?.enabled ?? resolveEnabled(configuredEnabled),
     configuredEnabled,
@@ -351,6 +396,16 @@ export const VoicePlugin: Plugin = async (input, options) => {
         instruct: config.qwen3TtsInstruct,
         language: config.qwen3TtsLanguage,
         stream: config.qwen3TtsStream,
+      },
+      "higgs-audio-v3": {
+        endpoint: config.higgsEndpoint,
+        timeoutMs: config.higgsTimeoutMs,
+        voice: config.higgsVoice,
+        agent: config.higgsAgent,
+        temperature: config.higgsTemperature,
+        topK: config.higgsTopK,
+        maxNewTokens: config.higgsMaxNewTokens,
+        responseFormat: config.higgsResponseFormat,
       },
     };
     return new ProviderRegistry({
