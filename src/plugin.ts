@@ -2,7 +2,8 @@ import { tool, type Plugin } from "@opencode-ai/plugin";
 import { readFileSync, existsSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
-import { createProvider, type ProviderName, type TTSProvider } from "./providers/index.js";
+import { type ProviderName, type TTSProvider } from "./providers/index.js";
+import { ProviderRegistry, type RegistryProviderConfigs } from "./provider-registry.js";
 import { chunkForTTS } from "./chunker.js";
 import {
   PlaybackQueue,
@@ -313,19 +314,35 @@ export const VoicePlugin: Plugin = async (input, options) => {
     volume: voiceOptions?.volume ?? agentConfig?.volume ?? 1.0,
   };
 
-  // Instantiate the provider once at plugin init based on which backend
-  // is selected. Each provider only sees the config it cares about.
-  function buildProvider(): TTSProvider {
-    if (config.provider === "omnivoice") {
-      return createProvider("omnivoice", {
+  // Pre-construct every provider whose flat-shape config keys are
+  // available, regardless of which one is the default. This lets
+  // /voice switch swap to any provider at runtime with no model load,
+  // no connection handshake, no delay.
+  //
+  // The legacy flat-shape config (qwen3TtsEndpoint, omnivoiceEndpoint,
+  // etc.) populates each provider with the same defaults we used
+  // before the registry existed. A future commit will add a nested
+  // `providers: { ... }` shape that allows per-provider config without
+  // the flat-key prefixing.
+  function buildRegistry(): ProviderRegistry {
+    const providers: RegistryProviderConfigs = {
+      elevenlabs: {
+        voiceId: config.voiceId,
+        modelId: config.modelId,
+        apiKeyPath: config.apiKeyPath,
+        stability: config.stability,
+        similarityBoost: config.similarityBoost,
+        style: config.style,
+        useSpeakerBoost: config.useSpeakerBoost,
+        preserveVoiceDefaults: config.preserveVoiceDefaults,
+      },
+      omnivoice: {
         endpoint: config.omnivoiceEndpoint,
         timeoutMs: config.omnivoiceTimeoutMs,
         voice: config.omnivoiceVoice,
         agent: config.omnivoiceAgent,
-      });
-    }
-    if (config.provider === "qwen3-tts") {
-      return createProvider("qwen3-tts", {
+      },
+      "qwen3-tts": {
         endpoint: config.qwen3TtsEndpoint,
         timeoutMs: config.qwen3TtsTimeoutMs,
         voice: config.qwen3TtsVoice,
@@ -334,21 +351,15 @@ export const VoicePlugin: Plugin = async (input, options) => {
         instruct: config.qwen3TtsInstruct,
         language: config.qwen3TtsLanguage,
         stream: config.qwen3TtsStream,
-      });
-    }
-    return createProvider("elevenlabs", {
-      voiceId: config.voiceId,
-      modelId: config.modelId,
-      apiKeyPath: config.apiKeyPath,
-      stability: config.stability,
-      similarityBoost: config.similarityBoost,
-      style: config.style,
-      useSpeakerBoost: config.useSpeakerBoost,
-      preserveVoiceDefaults: config.preserveVoiceDefaults,
+      },
+    };
+    return new ProviderRegistry({
+      providers,
+      defaultProvider: config.provider,
     });
   }
 
-  const provider: TTSProvider = buildProvider();
+  const registry: ProviderRegistry = buildRegistry();
 
   // Single playback coordinator for the lifetime of this plugin instance.
   // Every speak call (tool, tagged extraction, all-mode turn) routes through
@@ -362,7 +373,7 @@ export const VoicePlugin: Plugin = async (input, options) => {
   //   - "interrupt" is currently identical to "replace" but named distinctly
   //     so a future implementation can diverge (e.g., explicit barge-in
   //     semantics with a notification ping).
-  const playbackQueue = new PlaybackQueue(provider);
+  const playbackQueue = new PlaybackQueue(() => registry.getActive());
 
   /**
    * Internal helper that drives a request through the provider and returns
@@ -441,7 +452,7 @@ Chunker produced no output.
       speechText.length > 80 ? speechText.substring(0, 80) + "..." : speechText;
     return `<speak_started>
 Playing speech (non-blocking): "${preview}"
-Provider: ${provider.name}
+Provider: ${registry.getActiveName()}
 Handle: ${firstHandle.id}
 Mode: ${firstMode}
 Chunks: ${chunks.length}
@@ -566,7 +577,8 @@ USAGE GUIDANCE:
             enabled: config.enabled,
             speakMode: config.speakMode,
             configuredEnabled: config.configuredEnabled,
-            provider: config.provider,
+            provider: registry.getActiveName(),
+            availableProviders: registry.listNames(),
             voiceId: config.voiceId,
             modelId: config.modelId,
             preserveVoiceDefaults: config.preserveVoiceDefaults,

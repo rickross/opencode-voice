@@ -50,7 +50,17 @@ export class PlaybackQueue {
    */
   private draining = false;
 
-  constructor(private readonly provider: TTSProvider) {}
+  /**
+   * The queue accepts a *resolver function* rather than a provider
+   * directly. This means `getProvider()` is called at speak-time, not
+   * at queue-construction time — which makes runtime provider
+   * switching seamless. The registry can swap the active provider at
+   * any moment and the next speak() picks it up automatically.
+   *
+   * In-flight playback continues on whichever provider started it; the
+   * queue does not migrate handles mid-stream.
+   */
+  constructor(private readonly getProvider: () => TTSProvider) {}
 
   /**
    * True while a `startNow` is in flight (between calling provider.speak
@@ -126,7 +136,7 @@ export class PlaybackQueue {
   private async startNow(req: TTSRequest): Promise<PlaybackHandle> {
     this.starting = true;
     try {
-      const handle = await this.provider.speak(req);
+      const handle = await this.getProvider().speak(req);
       this.current = handle;
       void handle.done.finally(() => {
         // Only clear if we're still the current handle. A subsequent
