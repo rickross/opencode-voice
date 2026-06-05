@@ -281,12 +281,37 @@ function streamPcmViaHttpRequest(
       "1",
       "-",
     ],
-    { stdio: ["pipe", "ignore", "ignore"] },
+    {
+      // Capture stderr so we can surface sox warnings/errors in the
+      // debug log. Sox is otherwise silent about underruns, format
+      // mismatches, and other conditions that affect playback duration.
+      stdio: ["pipe", "ignore", "pipe"],
+    },
   );
 
+  let soxStderr = "";
+  child.stderr?.setEncoding("utf-8");
+  child.stderr?.on("data", (chunk: string) => {
+    soxStderr += chunk;
+  });
+
   const playbackDone = new Promise<void>((resolve) => {
-    child.on("exit", () => resolve());
-    child.on("error", () => resolve());
+    child.on("exit", (code, signal) => {
+      if (process.env.OPENCODE_VOICE_DEBUG !== "0") {
+        const trimmed = soxStderr.trim();
+        const summary = trimmed.length > 0 ? ` stderr=${JSON.stringify(trimmed)}` : "";
+        console.error(
+          `[higgs-audio-v3] play exit: code=${code} signal=${signal}${summary}`,
+        );
+      }
+      resolve();
+    });
+    child.on("error", (err) => {
+      if (process.env.OPENCODE_VOICE_DEBUG !== "0") {
+        console.error(`[higgs-audio-v3] play spawn error: ${err.message}`);
+      }
+      resolve();
+    });
   });
 
   const stdin = child.stdin!;
