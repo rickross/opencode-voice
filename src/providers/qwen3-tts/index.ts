@@ -2,7 +2,7 @@ import { spawn } from "child_process";
 import { appendFileSync } from "fs";
 import { request as httpRequest, type IncomingMessage } from "http";
 import { URL } from "url";
-import type { TTSProvider, TTSRequest, PlaybackHandle } from "./types.js";
+import type { TTSProvider, TTSRequest, PlaybackHandle } from "../types.js";
 
 /**
  * Side-channel observability log. Written directly from the provider

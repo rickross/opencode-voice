@@ -1,5 +1,5 @@
 import { spawn } from "child_process";
-import type { TTSProvider, TTSRequest, PlaybackHandle } from "./types.js";
+import type { TTSProvider, TTSRequest, PlaybackHandle } from "../types.js";
 
 /**
  * OmniVoice TTS provider.

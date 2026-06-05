@@ -1,6 +1,6 @@
-import { createElevenLabsProvider } from "./elevenlabs.js";
-import { createOmniVoiceProvider } from "./omnivoice.js";
-import { createQwen3TtsProvider } from "./qwen3-tts.js";
+import { createElevenLabsProvider } from "./elevenlabs/index.js";
+import { createOmniVoiceProvider } from "./omnivoice/index.js";
+import { createQwen3TtsProvider } from "./qwen3-tts/index.js";
 import type { TTSProvider } from "./types.js";
 
 /**

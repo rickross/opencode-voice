@@ -1,6 +1,6 @@
 import { readFileSync } from "fs";
 import { spawn } from "child_process";
-import type { TTSProvider, TTSRequest, PlaybackHandle } from "./types.js";
+import type { TTSProvider, TTSRequest, PlaybackHandle } from "../types.js";
 
 /**
  * ElevenLabs streaming TTS provider.
