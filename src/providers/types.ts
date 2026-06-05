@@ -46,9 +46,19 @@ export interface PlaybackHandle {
  * A TTS backend implementation.
  *
  * `name` is a stable identifier used in config and logs.
- * `speak()` returns a handle as soon as playback has started (non-blocking).
+ *
+ * `capabilitiesDoc` returns the contents of this provider's
+ * CAPABILITIES.md — a human-readable description of what the provider
+ * supports (inline tags, request parameters, voice cloning model,
+ * known sharp edges). Surfaced by `/voice describe` and intended to
+ * be read by the model so it can adapt its output to whichever
+ * provider is currently active.
+ *
+ * `speak()` returns a handle as soon as playback has started
+ * (non-blocking).
  */
 export interface TTSProvider {
   readonly name: string;
+  readonly capabilitiesDoc: string;
   speak(req: TTSRequest): Promise<PlaybackHandle>;
 }

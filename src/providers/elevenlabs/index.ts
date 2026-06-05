@@ -1,6 +1,11 @@
 import { readFileSync } from "fs";
 import { spawn } from "child_process";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
 import type { TTSProvider, TTSRequest, PlaybackHandle } from "../types.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const CAPABILITIES_DOC = readFileSync(join(__dirname, "CAPABILITIES.md"), "utf-8");
 
 /**
  * ElevenLabs streaming TTS provider.
@@ -117,6 +122,7 @@ function streamAudioToPlayer(
 export function createElevenLabsProvider(config: ElevenLabsConfig): TTSProvider {
   return {
     name: "elevenlabs",
+    capabilitiesDoc: CAPABILITIES_DOC,
 
     async speak(req: TTSRequest): Promise<PlaybackHandle> {
       const opts = (req.opts ?? {}) as ElevenLabsRequestOpts;

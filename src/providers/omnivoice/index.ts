@@ -1,5 +1,11 @@
 import { spawn } from "child_process";
+import { readFileSync } from "fs";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
 import type { TTSProvider, TTSRequest, PlaybackHandle } from "../types.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const CAPABILITIES_DOC = readFileSync(join(__dirname, "CAPABILITIES.md"), "utf-8");
 
 /**
  * OmniVoice TTS provider.
@@ -113,6 +119,7 @@ export function createOmniVoiceProvider(config: OmniVoiceConfig): TTSProvider {
 
   return {
     name: "omnivoice",
+    capabilitiesDoc: CAPABILITIES_DOC,
 
     async speak(req: TTSRequest): Promise<PlaybackHandle> {
       const opts = (req.opts ?? {}) as OmniVoiceRequestOpts;

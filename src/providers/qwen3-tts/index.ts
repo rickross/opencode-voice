@@ -1,8 +1,12 @@
 import { spawn } from "child_process";
-import { appendFileSync } from "fs";
+import { appendFileSync, readFileSync } from "fs";
 import { request as httpRequest, type IncomingMessage } from "http";
-import { URL } from "url";
+import { dirname, join } from "path";
+import { URL, fileURLToPath } from "url";
 import type { TTSProvider, TTSRequest, PlaybackHandle } from "../types.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const CAPABILITIES_DOC = readFileSync(join(__dirname, "CAPABILITIES.md"), "utf-8");
 
 /**
  * Side-channel observability log. Written directly from the provider
@@ -555,6 +559,7 @@ export function createQwen3TtsProvider(config: Qwen3TtsConfig): TTSProvider {
 
   return {
     name: "qwen3-tts",
+    capabilitiesDoc: CAPABILITIES_DOC,
 
     async speak(req: TTSRequest): Promise<PlaybackHandle> {
       const callId = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
