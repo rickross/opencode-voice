@@ -1,7 +1,8 @@
 import { spawn } from "child_process";
 import { readFileSync } from "fs";
+import { request as httpRequest, type IncomingMessage } from "http";
 import { dirname, join } from "path";
-import { fileURLToPath } from "url";
+import { URL, fileURLToPath } from "url";
 import type { TTSProvider, TTSRequest, PlaybackHandle } from "../types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -84,11 +85,24 @@ export interface HiggsAudioV3Config {
    * Response audio format. Accepted by SGLang-Omni:
    *   "wav" (default), "mp3", "flac", "opus", "aac", "pcm"
    *
-   * This first cut supports wav and mp3 non-streaming. pcm requires
-   * the streaming path which is not yet wired up here.
+   * For non-streaming, pick "wav" or "mp3". For streaming, "pcm" is
+   * the recommended choice (raw 16-bit signed mono 24kHz, no SSE
+   * wrapping, lowest TTFA). When `stream: true` the provider
+   * automatically uses `stream_format: "audio"` + `response_format: "pcm"`
+   * regardless of this setting so the streaming-path defaults are
+   * consistent with the SGLang-Omni recommendation.
    */
   responseFormat?: "wav" | "mp3";
-  /** Streaming will be added in a follow-up commit. */
+  /**
+   * When true, stream raw PCM bytes from the server and pipe directly
+   * into `play -t raw -r 24000 -e signed -b 16 -c 1 -` for lowest
+   * time-to-first-audio. The server returns audio/pcm bytes (no SSE
+   * wrapping) when `stream_format: "audio"` + `response_format: "pcm"`
+   * are set, which this provider does automatically when stream=true.
+   *
+   * When false (default), the provider sends a non-streaming request
+   * and pipes the whole WAV/MP3 body to the player when it arrives.
+   */
   stream?: boolean;
 }
 
@@ -141,6 +155,8 @@ const DEFAULT_TEMPERATURE = 0.8;
 const DEFAULT_TOP_K = 50;
 const DEFAULT_MAX_NEW_TOKENS = 1024;
 const DEFAULT_RESPONSE_FORMAT = "wav" as const;
+const DEFAULT_STREAM = false;
+const PCM_SAMPLE_RATE_HZ = 24_000;
 
 let handleCounter = 0;
 function nextHandleId(): string {
@@ -207,6 +223,152 @@ function streamAudioToPlayer(
   return { stop, done };
 }
 
+/**
+ * Streaming PCM path via Node's http.request, bypassing fetch.
+ *
+ * Mirrors the same shape qwen3-tts uses for its streaming path. The
+ * OpenCode plugin runtime has been observed to hang on streaming
+ * chunked responses through fetch(); http.request avoids it by giving
+ * us explicit chunk-level control via the IncomingMessage 'data'
+ * event.
+ *
+ * The server returns raw 16-bit signed mono PCM at 24kHz with no
+ * header when `stream: true` + `stream_format: "audio"` +
+ * `response_format: "pcm"` are set. `play -t raw -r 24000 -e signed -b 16 -c 1`
+ * is told the format explicitly so it can emit audio on the first chunk
+ * (sub-second TTFA).
+ */
+function streamPcmViaHttpRequest(
+  endpointUrl: string,
+  bodyJson: string,
+  volume: number,
+  timeoutMs: number,
+): { stop: () => void; done: Promise<void>; fetchPromise: Promise<void> } {
+  const child = spawn(
+    "play",
+    [
+      "-v",
+      String(volume),
+      "-t",
+      "raw",
+      "-r",
+      String(PCM_SAMPLE_RATE_HZ),
+      "-e",
+      "signed",
+      "-b",
+      "16",
+      "-c",
+      "1",
+      "-",
+    ],
+    { stdio: ["pipe", "ignore", "ignore"] },
+  );
+
+  const playbackDone = new Promise<void>((resolve) => {
+    child.on("exit", () => resolve());
+    child.on("error", () => resolve());
+  });
+
+  const stdin = child.stdin!;
+  let cancelled = false;
+  let req: ReturnType<typeof httpRequest> | undefined;
+
+  const fetchPromise = new Promise<void>((resolve, reject) => {
+    let u: URL;
+    try {
+      u = new URL(endpointUrl);
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
+    req = httpRequest(
+      {
+        host: u.hostname,
+        port: u.port || 80,
+        path: u.pathname + u.search,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(bodyJson),
+          Accept: "*/*",
+        },
+      },
+      (res: IncomingMessage) => {
+        if (res.statusCode && res.statusCode >= 400) {
+          let body = "";
+          res.setEncoding("utf-8");
+          res.on("data", (c) => (body += c));
+          res.on("end", () => {
+            reject(
+              new Error(
+                `Higgs Audio v3 streaming error (${res.statusCode}): ${body || "no body"}`,
+              ),
+            );
+          });
+          return;
+        }
+
+        res.on("data", (chunk: Buffer) => {
+          if (cancelled) return;
+          if (!stdin.write(chunk)) {
+            res.pause();
+            stdin.once("drain", () => res.resume());
+          }
+        });
+        res.on("end", () => {
+          try {
+            stdin.end();
+          } catch {
+            /* ignore */
+          }
+          resolve();
+        });
+        res.on("error", (err) => {
+          try {
+            stdin.end();
+          } catch {
+            /* ignore */
+          }
+          reject(err);
+        });
+      },
+    );
+
+    req.setTimeout(timeoutMs, () => {
+      req?.destroy(new Error(`Higgs Audio v3 http.request timed out after ${timeoutMs}ms`));
+    });
+
+    req.on("error", (err) => {
+      try {
+        stdin.end();
+      } catch {
+        /* ignore */
+      }
+      reject(err);
+    });
+
+    req.write(bodyJson);
+    req.end();
+  });
+
+  const stop = () => {
+    cancelled = true;
+    try {
+      req?.destroy();
+    } catch {
+      /* ignore */
+    }
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      /* ignore */
+    }
+  };
+
+  return { stop, done: playbackDone, fetchPromise };
+}
+
 export function createHiggsAudioV3Provider(config: HiggsAudioV3Config): TTSProvider {
   const endpoint = config.endpoint.replace(/\/+$/, "");
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -217,8 +379,16 @@ export function createHiggsAudioV3Provider(config: HiggsAudioV3Config): TTSProvi
 
     async speak(req: TTSRequest): Promise<PlaybackHandle> {
       const opts = (req.opts ?? {}) as HiggsAudioV3RequestOpts;
-      const responseFormat =
-        opts.responseFormat ?? config.responseFormat ?? DEFAULT_RESPONSE_FORMAT;
+      const stream = config.stream ?? DEFAULT_STREAM;
+
+      // Format selection.
+      //   - Streaming forces response_format="pcm" + stream_format="audio"
+      //     per the SGLang-Omni cookbook recommendation for lowest TTFA.
+      //   - Non-streaming honors opts.responseFormat ?? config.responseFormat,
+      //     defaulting to "wav".
+      const responseFormat: "wav" | "mp3" | "pcm" = stream
+        ? "pcm"
+        : opts.responseFormat ?? config.responseFormat ?? DEFAULT_RESPONSE_FORMAT;
 
       // Build the request body. Voice selection precedence:
       //   1. Per-call referenceCodes (caller already loaded the JSON)
@@ -234,6 +404,12 @@ export function createHiggsAudioV3Provider(config: HiggsAudioV3Config): TTSProvi
         max_new_tokens:
           opts.maxNewTokens ?? config.maxNewTokens ?? DEFAULT_MAX_NEW_TOKENS,
       };
+
+      if (stream) {
+        body.stream = true;
+        // stream_format=audio bypasses SSE wrapping for raw PCM bytes.
+        body.stream_format = "audio";
+      }
 
       if (opts.referenceCodes) {
         body.reference_codes = opts.referenceCodes;
@@ -257,15 +433,49 @@ export function createHiggsAudioV3Provider(config: HiggsAudioV3Config): TTSProvi
       if (req.speed !== undefined) body.speed = req.speed;
       if (config.agent !== undefined) body.agent = config.agent;
 
+      const endpointUrl = `${endpoint}/v1/audio/speech`;
+      const bodyJson = JSON.stringify(body);
+
+      // Streaming PCM path (http.request, no fetch). Returns immediately
+      // with a handle; the player consumes the chunked PCM as it arrives.
+      if (stream) {
+        const { stop, done, fetchPromise } = streamPcmViaHttpRequest(
+          endpointUrl,
+          bodyJson,
+          req.volume,
+          timeoutMs,
+        );
+        // Surface server-side errors (4xx/5xx, connection failure) by
+        // letting fetchPromise reject. We await its first tick so the
+        // caller sees the error here rather than via the playback handle.
+        fetchPromise.catch((err) => {
+          // The fetch promise rejection doesn't automatically abort the
+          // playback child; stop() handles that.
+          stop();
+          // The rejection will also propagate via `done` because stdin.end()
+          // closes the player, which exits and resolves done().
+          // We log to stderr so it's visible without needing to await.
+          console.error(`[higgs-audio-v3] streaming error:`, err);
+        });
+
+        return {
+          id: nextHandleId(),
+          startedAt: Date.now(),
+          stop,
+          done,
+        };
+      }
+
+      // Non-streaming WAV/MP3 path (fetch + buffered body).
       const controller = new AbortController();
       const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
 
       let response: Response;
       try {
-        response = await fetch(`${endpoint}/v1/audio/speech`, {
+        response = await fetch(endpointUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
+          body: bodyJson,
           signal: controller.signal,
         });
       } catch (err) {
@@ -294,7 +504,11 @@ export function createHiggsAudioV3Provider(config: HiggsAudioV3Config): TTSProvi
         throw new Error("Higgs Audio v3 returned no body");
       }
 
-      const { stop, done } = streamAudioToPlayer(response.body, req.volume, responseFormat);
+      const { stop, done } = streamAudioToPlayer(
+        response.body,
+        req.volume,
+        responseFormat as "wav" | "mp3",
+      );
 
       return {
         id: nextHandleId(),

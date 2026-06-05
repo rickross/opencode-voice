@@ -196,11 +196,19 @@ cap unbounded generation. Override per-request via the opts fields
 when you need different behavior.
 
 **SGLang-Omni response formats supported by the server:** wav (default),
-mp3, flac, opus, aac, pcm. This provider's first cut handles wav and
-mp3 non-streaming. Streaming (SSE WAV chunks or raw PCM via
-`stream_format=audio` + `response_format=pcm`) will land in a
-follow-up commit using the same `http.request` workaround qwen3-tts
-already uses for the OpenCode-plugin-runtime fetch hang.
+mp3, flac, opus, aac, pcm. This provider supports:
+
+- Non-streaming wav (default) or mp3 — buffered body, simplest path,
+  best for short utterances where TTFA isn't critical.
+- Streaming PCM — when `stream: true`, the provider automatically
+  sets `stream_format: "audio"` + `response_format: "pcm"` and pipes
+  raw 16-bit signed mono 24kHz PCM bytes directly to the player. No
+  SSE wrapping to parse, lowest TTFA, the SGLang-Omni-recommended
+  shape for low-latency interactive use.
+
+The streaming path uses Node's `http.request` rather than `fetch` to
+avoid an OpenCode-plugin-runtime hang on streaming chunked responses
+(the same workaround `qwen3-tts` already uses).
 
 ## Voice cloning
 
@@ -233,6 +241,8 @@ more than the inline control surface.
 
 ## Configuration shape
 
+For non-streaming WAV (simplest, no TTFA optimization):
+
 ```jsonc
 {
   "endpoint": "http://zion.irelate.ai:5012",
@@ -242,9 +252,29 @@ more than the inline control surface.
   "temperature": 0.8,
   "topK": 50,
   "maxNewTokens": 1024,
-  "responseFormat": "wav"
+  "responseFormat": "wav",
+  "stream": false
 }
 ```
+
+For streaming PCM (lowest TTFA, recommended for conversation):
+
+```jsonc
+{
+  "endpoint": "http://zion.irelate.ai:5012",
+  "timeoutMs": 90000,
+  "voice": "solene",
+  "agent": "solene",
+  "temperature": 0.8,
+  "topK": 50,
+  "maxNewTokens": 1024,
+  "stream": true
+}
+```
+
+When `stream: true`, the provider overrides `responseFormat` to "pcm"
+and sets `stream_format: "audio"` automatically. The setting on the
+config object only matters for non-streaming requests.
 
 ## Known sharp edges
 

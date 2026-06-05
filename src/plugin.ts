@@ -159,8 +159,16 @@ export interface VoiceConfig {
   higgsTopK?: number;
   /** Max generation tokens for Higgs (default 1024). */
   higgsMaxNewTokens?: number;
-  /** Response audio format: "wav" (default) or "mp3". */
+  /** Response audio format: "wav" (default) or "mp3". Ignored when stream=true. */
   higgsResponseFormat?: "wav" | "mp3";
+  /**
+   * When true, use the streaming PCM path (raw 16-bit signed mono
+   * 24kHz piped directly into `play -t raw`). Lowest TTFA, recommended
+   * for conversational use. When false (default), the provider sends
+   * a non-streaming request and pipes the whole WAV/MP3 body to the
+   * player when it arrives.
+   */
+  higgsStream?: boolean;
 
   // --- Shared ---
   enabled?: boolean | "on" | "off" | "default";
@@ -351,6 +359,7 @@ export const VoicePlugin: Plugin = async (input, options) => {
     higgsTopK: voiceOptions?.higgsTopK ?? agentConfig?.higgsTopK,
     higgsMaxNewTokens: voiceOptions?.higgsMaxNewTokens ?? agentConfig?.higgsMaxNewTokens,
     higgsResponseFormat: voiceOptions?.higgsResponseFormat ?? agentConfig?.higgsResponseFormat,
+    higgsStream: voiceOptions?.higgsStream ?? agentConfig?.higgsStream,
     // Runtime / shared
     enabled: runtimeState?.enabled ?? resolveEnabled(configuredEnabled),
     configuredEnabled,
@@ -406,6 +415,7 @@ export const VoicePlugin: Plugin = async (input, options) => {
         topK: config.higgsTopK,
         maxNewTokens: config.higgsMaxNewTokens,
         responseFormat: config.higgsResponseFormat,
+        stream: config.higgsStream,
       },
     };
     return new ProviderRegistry({
