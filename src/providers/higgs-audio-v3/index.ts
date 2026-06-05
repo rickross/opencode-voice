@@ -315,6 +315,12 @@ function streamPcmViaHttpRequest(
         },
       },
       (res: IncomingMessage) => {
+        if (process.env.OPENCODE_VOICE_DEBUG !== "0") {
+          console.error(
+            `[higgs-audio-v3] response: status=${res.statusCode} content-type=${res.headers["content-type"] ?? "?"}`,
+          );
+        }
+
         if (res.statusCode && res.statusCode >= 400) {
           let body = "";
           res.setEncoding("utf-8");
@@ -329,14 +335,22 @@ function streamPcmViaHttpRequest(
           return;
         }
 
+        let bytesReceived = 0;
         res.on("data", (chunk: Buffer) => {
           if (cancelled) return;
+          bytesReceived += chunk.length;
           if (!stdin.write(chunk)) {
             res.pause();
             stdin.once("drain", () => res.resume());
           }
         });
         res.on("end", () => {
+          if (process.env.OPENCODE_VOICE_DEBUG !== "0") {
+            const seconds = (bytesReceived / 48000).toFixed(2);
+            console.error(
+              `[higgs-audio-v3] stream complete: ${bytesReceived} bytes (~${seconds}s @ 24kHz 16-bit mono)`,
+            );
+          }
           try {
             stdin.end();
           } catch {
@@ -468,6 +482,26 @@ export function createHiggsAudioV3Provider(config: HiggsAudioV3Config): TTSProvi
 
       const endpointUrl = `${endpoint}/v1/audio/speech`;
       const bodyJson = JSON.stringify(body);
+
+      if (process.env.OPENCODE_VOICE_DEBUG !== "0") {
+        // Log a redacted view of the request: full input text, key params,
+        // but trim references array's transcript for noise control.
+        const debugBody: Record<string, unknown> = {
+          input: body.input,
+          response_format: body.response_format,
+          stream: body.stream,
+          stream_format: body.stream_format,
+          temperature: body.temperature,
+          top_k: body.top_k,
+          max_new_tokens: body.max_new_tokens,
+        };
+        if (body.references) debugBody.references = "[ref array]";
+        if (body.reference_codes) debugBody.reference_codes = "[codes array]";
+        if (body.voice) debugBody.voice = body.voice;
+        console.error(
+          `[higgs-audio-v3] POST ${endpointUrl} body=${JSON.stringify(debugBody)}`,
+        );
+      }
 
       // Streaming PCM path (http.request, no fetch). Returns immediately
       // with a handle; the player consumes the chunked PCM as it arrives.

@@ -527,6 +527,21 @@ Chunker produced no output.
 </speak_skipped>`;
     }
 
+    // Debug instrumentation: emit each chunk's text + length so we can
+    // see exactly what reached the provider when something cuts off
+    // mid-utterance. Turn this off by setting OPENCODE_VOICE_DEBUG=0.
+    if (process.env.OPENCODE_VOICE_DEBUG !== "0") {
+      console.error(
+        `[opencode-voice] speakViaProvider: ${chunks.length} chunk(s) after normalize+chunk`,
+      );
+      for (let i = 0; i < chunks.length; i += 1) {
+        const c = chunks[i];
+        console.error(
+          `[opencode-voice]   chunk ${i + 1}/${chunks.length} (${c.length} chars): ${JSON.stringify(c)}`,
+        );
+      }
+    }
+
     const firstMode = args.mode ?? DEFAULT_SPEAK_MODE;
     const firstHandle = await playbackQueue.speak(
       {
@@ -537,6 +552,11 @@ Chunker produced no output.
       },
       firstMode,
     );
+    if (process.env.OPENCODE_VOICE_DEBUG !== "0") {
+      console.error(
+        `[opencode-voice]   chunk 1/${chunks.length} queued, handle=${firstHandle}, mode=${firstMode}`,
+      );
+    }
 
     // Queue any remaining chunks behind the first one. They inherit
     // the same volume / speed / opts and always play in "queue" mode
@@ -552,6 +572,13 @@ Chunker produced no output.
           },
           "queue",
         )
+        .then((handle) => {
+          if (process.env.OPENCODE_VOICE_DEBUG !== "0") {
+            console.error(
+              `[opencode-voice]   chunk ${i + 1}/${chunks.length} queued, handle=${handle}`,
+            );
+          }
+        })
         .catch((err) => {
           console.error(
             `[opencode-voice] chunk ${i + 1}/${chunks.length} failed:`,
