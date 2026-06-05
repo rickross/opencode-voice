@@ -285,8 +285,21 @@ function normalizeForSpeech(text: string): string {
   // Horizontal rules.
   out = out.replace(/^[ \t]*[-*_]{3,}[ \t]*$/gm, " ");
 
-  // Collapse whitespace.
-  out = out.replace(/\s{2,}/g, " ").trim();
+  // Collapse whitespace — but preserve paragraph breaks (\n\n+) as
+  // structural markers. The chunker downstream splits on paragraph
+  // boundaries to keep TTS providers from choking on internal blank
+  // lines (Higgs Audio v3 in particular interprets \n\n as "text is
+  // done" and silences the remainder of its generation budget).
+  //
+  // Strategy: canonicalize all paragraph-break sequences to exactly
+  // "\n\n", then collapse non-paragraph whitespace runs to single
+  // spaces. Order matters: paragraph step first, then per-paragraph
+  // whitespace collapse, then rejoin.
+  out = out
+    .split(/\n{2,}/)
+    .map((para) => para.replace(/\s+/g, " ").trim())
+    .filter((para) => para.length > 0)
+    .join("\n\n");
 
   return out;
 }
