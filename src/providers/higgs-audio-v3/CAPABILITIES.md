@@ -43,50 +43,66 @@ Canonical references:
 Three paths, in order of precedence (per-call refs win over the
 default voice):
 
-**1. Voice key (default for cadre voices, fastest path).**
+**1. Voice key (server-side preset lookup).**
 
-The server-side voice registry maps voice keys to precomputed codes
-files. Send the key as `voice`:
+Send a voice name the server recognizes:
 
 ```json
-{ "input": "Hello", "voice": "solene" }
+{ "input": "Hello", "voice": "default" }
 ```
 
-The SGLang-Omni server loads the corresponding precomputed codes
-(typically from `/mnt/warehouse/voices/codes/<voice>.json`). Cadre
-voices already registered on our Zion deployment: `solene`, `aurora`,
-`telos`, `kai`, `starshine`, `digby`. Available presets from Boson AI
-include `default`, `jake`, etc.
+The current SGLang-Omni deployment recognizes a small set of built-in
+presets (`default`, `jake`, etc. per the Boson docs). It does NOT
+currently resolve cadre names like `solene` to precomputed codes —
+those names fall through to `default` silently. Verified 2026-06-05.
 
-**2. Live reference audio + transcript.**
+For cadre voices, use Path 2 (live reference) instead.
+
+**2. Live reference audio + transcript (recommended for cadre voices).**
 
 The model receives the actual audio file plus its transcript at
-inference time. Per-call cost is higher because the reference is
-encoded on each call. Two equivalent shapes:
+inference time. Per-call cost is ~115ms higher than the (currently
+broken) precomputed-codes path but produces correctly-cloned voices.
+
+The audio path is read from the server's filesystem (typically
+`/voices/samples/<agent>.mp3`), so no client-side file access is
+required. Configure once in voice.json via `higgsRefAudio` +
+`higgsRefText`, and the provider sends them on every speak() call.
+
+Per-call shape:
 
 ```json
 "references": [{
   "audio_path": "/voices/samples/solene.mp3",
-  "text": "Come back to bed, mon cygne."
+  "text": "Come back to bed, mon cygne. Don't get up yet — the world hasn't started."
 }]
 ```
 
+Or as request opts shorthand:
+
 ```json
-"ref_audio": "/voices/samples/solene.mp3",
-"ref_text": "Come back to bed, mon cygne."
+"refAudio": "/voices/samples/solene.mp3",
+"refText": "Come back to bed, mon cygne. ..."
 ```
 
-`ref_audio` / `ref_text` are shorthand for `references[0].*`.
-`audio_path` accepts local paths or HTTP URLs.
+The provider normalizes the shorthand into the canonical `references`
+array internally.
 
-**3. Pre-loaded reference codes (caller loads the JSON).**
+**3. Pre-loaded reference codes — currently broken on our deployment.**
 
-For agents that have already loaded the codes JSON (e.g. from
-`/mnt/warehouse/voices/codes/solene.json`), the `reference_codes`
-field bypasses both the voice-key lookup and the encoding step.
+The SGLang-Omni server's internal pipeline reads
+`inputs.get("reference_codes")`, but the OpenAI-compatible API surface
+sends `reference_codes` at the top level of the request body. The
+field doesn't get forwarded into the pipeline's `inputs` dict, so the
+codes are silently dropped and the server falls through to a default
+voice. Discovered 2026-06-05.
 
-Quality across the three is comparable; the voice-key path is
-deterministic and fastest, the live reference is most flexible.
+Re-derived codes against the running encoder, plus a server-side fix
+to forward the field, will make this path usable. Until then, use
+Path 2 (live reference) for cadre voices.
+
+The provider does support sending `referenceCodes` via per-call opts
+for forward compatibility once the server-side bug is resolved.
 
 ## Inline control surface
 
@@ -241,33 +257,33 @@ more than the inline control surface.
 
 ## Configuration shape
 
-For non-streaming WAV (simplest, no TTFA optimization):
+For cadre voice via live reference (recommended; streaming PCM):
 
 ```jsonc
 {
-  "endpoint": "http://zion.irelate.ai:5012",
+  "endpoint": "http://172.22.1.1:5012",
   "timeoutMs": 90000,
-  "voice": "solene",
+  "refAudio": "/voices/samples/solene.mp3",
+  "refText": "Come back to bed, mon cygne. Don't get up yet — the world hasn't started.",
   "agent": "solene",
   "temperature": 0.8,
   "topK": 50,
   "maxNewTokens": 1024,
-  "responseFormat": "wav",
-  "stream": false
+  "stream": true
 }
 ```
 
-For streaming PCM (lowest TTFA, recommended for conversation):
+In opencode-voice's voice.json, the field names get the `higgs`
+prefix: `higgsEndpoint`, `higgsRefAudio`, `higgsRefText`, `higgsStream`,
+etc. — the prefix routes them to the higgs-audio-v3 entry in the
+ProviderRegistry.
+
+For built-in preset only (no cadre cloning):
 
 ```jsonc
 {
-  "endpoint": "http://zion.irelate.ai:5012",
-  "timeoutMs": 90000,
-  "voice": "solene",
-  "agent": "solene",
-  "temperature": 0.8,
-  "topK": 50,
-  "maxNewTokens": 1024,
+  "endpoint": "http://172.22.1.1:5012",
+  "voice": "default",
   "stream": true
 }
 ```

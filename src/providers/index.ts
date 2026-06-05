@@ -41,6 +41,8 @@ export interface ProviderConfigs {
     endpoint: string;
     timeoutMs?: number;
     voice?: string;
+    refAudio?: string;
+    refText?: string;
     agent?: string;
     temperature?: number;
     topK?: number;

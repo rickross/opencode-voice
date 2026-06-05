@@ -54,13 +54,33 @@ export interface HiggsAudioV3Config {
   /** Per-request timeout in milliseconds. */
   timeoutMs?: number;
   /**
-   * Default voice key. Resolves server-side to a precomputed codes
-   * file at /mnt/warehouse/voices/codes/<voice>.json. Common cadre
-   * voices: solene, aurora, telos, kai, starshine, digby.
+   * Default voice key for the server's built-in presets (e.g. "default",
+   * "jake"). The SGLang-Omni server does NOT currently resolve cadre
+   * voice keys like "solene" — that name falls through to default. For
+   * cadre voices use `refAudio` + `refText` below.
    *
-   * Ignored when `references` or `referenceCodes` are set per-request.
+   * Ignored when `refAudio` is set, or when per-request `references` /
+   * `referenceCodes` are set.
    */
   voice?: string;
+  /**
+   * Server-side path or URL to a reference audio clip used for voice
+   * cloning. The SGLang-Omni container reads this path from its own
+   * filesystem (typically `/voices/samples/<voice>.mp3`), not from
+   * the client's filesystem. Pair with `refText` for cleanest clones.
+   *
+   * When set, this overrides `voice` and triggers the live-reference
+   * path for every call this provider serves. This is the recommended
+   * path for cadre voices until the server-side `voice: <name>` →
+   * codes-file lookup is fixed.
+   */
+  refAudio?: string;
+  /**
+   * Transcript of the reference audio clip. Strongly recommended when
+   * `refAudio` is set — supplying the transcript materially improves
+   * cloning fidelity (per SGLang-Omni cookbook).
+   */
+  refText?: string;
   /**
    * Diagnostic caller id. Not used for routing or auth; emitted as a
    * field on each request body for server-side log correlation.
@@ -390,12 +410,14 @@ export function createHiggsAudioV3Provider(config: HiggsAudioV3Config): TTSProvi
         ? "pcm"
         : opts.responseFormat ?? config.responseFormat ?? DEFAULT_RESPONSE_FORMAT;
 
-      // Build the request body. Voice selection precedence:
+      // Build the request body. Voice selection precedence
+      // (per-call wins over config; references win over voice key):
       //   1. Per-call referenceCodes (caller already loaded the JSON)
-      //   2. Per-call references (server will encode)
-      //   3. Per-call refAudio+refText shorthand (server will encode)
-      //   4. Per-call voice (server uses precomputed codes)
-      //   5. Config-default voice
+      //   2. Per-call references array (canonical multi-ref shape)
+      //   3. Per-call refAudio+refText shorthand
+      //   4. Config-level refAudio+refText — recommended for cadre voices
+      //   5. Per-call voice (server preset lookup, e.g. "default", "jake")
+      //   6. Config-default voice
       const body: Record<string, unknown> = {
         input: req.text,
         response_format: responseFormat,
@@ -423,6 +445,17 @@ export function createHiggsAudioV3Provider(config: HiggsAudioV3Config): TTSProvi
           {
             audio_path: opts.refAudio,
             ...(opts.refText !== undefined ? { text: opts.refText } : {}),
+          },
+        ];
+      } else if (config.refAudio !== undefined) {
+        // Config-level reference: use on every speak() call. This is
+        // the recommended path for cadre voices since the SGLang-Omni
+        // `voice: <name>` → codes lookup currently falls through to
+        // default on our deployment.
+        body.references = [
+          {
+            audio_path: config.refAudio,
+            ...(config.refText !== undefined ? { text: config.refText } : {}),
           },
         ];
       } else {

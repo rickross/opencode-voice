@@ -143,11 +143,25 @@ export interface VoiceConfig {
   /** Per-request timeout when calling the Higgs endpoint (ms). */
   higgsTimeoutMs?: number;
   /**
-   * Server-side voice key (e.g. "solene", "aurora"). Resolves to a
-   * precomputed codes file on the server side. Defaults to the
-   * lowercased AGENT_NAME from environment if not specified.
+   * Server-side voice key for built-in Higgs presets (e.g. "default",
+   * "jake"). Cadre voices like "solene" do NOT resolve through this
+   * field on our SGLang-Omni deployment — they fall through to default.
+   * Use higgsRefAudio + higgsRefText for cadre voices.
    */
   higgsVoice?: string;
+  /**
+   * Server-side path to the reference audio clip for voice cloning.
+   * The SGLang-Omni container reads this from its own filesystem
+   * (typically /voices/samples/<agent>.mp3). Set this in voice.json
+   * for cadre voices; pair with higgsRefText for clean cloning.
+   */
+  higgsRefAudio?: string;
+  /**
+   * Transcript of the reference audio clip. Strongly recommended when
+   * higgsRefAudio is set — supplying the transcript materially improves
+   * cloning fidelity (per SGLang-Omni cookbook).
+   */
+  higgsRefText?: string;
   /**
    * Diagnostic caller id sent with every Higgs request for server-side
    * log correlation. Defaults to the lowercased AGENT_NAME.
@@ -347,10 +361,9 @@ export const VoicePlugin: Plugin = async (input, options) => {
     // Higgs Audio v3 config
     higgsEndpoint: voiceOptions?.higgsEndpoint ?? agentConfig?.higgsEndpoint ?? DEFAULT_HIGGS_ENDPOINT,
     higgsTimeoutMs: voiceOptions?.higgsTimeoutMs ?? agentConfig?.higgsTimeoutMs,
-    higgsVoice:
-      voiceOptions?.higgsVoice ??
-      agentConfig?.higgsVoice ??
-      process.env.AGENT_NAME?.toLowerCase(),
+    higgsVoice: voiceOptions?.higgsVoice ?? agentConfig?.higgsVoice,
+    higgsRefAudio: voiceOptions?.higgsRefAudio ?? agentConfig?.higgsRefAudio,
+    higgsRefText: voiceOptions?.higgsRefText ?? agentConfig?.higgsRefText,
     higgsAgent:
       voiceOptions?.higgsAgent ??
       agentConfig?.higgsAgent ??
@@ -410,6 +423,8 @@ export const VoicePlugin: Plugin = async (input, options) => {
         endpoint: config.higgsEndpoint,
         timeoutMs: config.higgsTimeoutMs,
         voice: config.higgsVoice,
+        refAudio: config.higgsRefAudio,
+        refText: config.higgsRefText,
         agent: config.higgsAgent,
         temperature: config.higgsTemperature,
         topK: config.higgsTopK,
