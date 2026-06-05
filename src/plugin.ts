@@ -279,11 +279,16 @@ function normalizeForSpeech(text: string): string {
   out = out.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
 
   // Bold / italic / emphasis markers (** *), keep inner text.
+  // Underscore patterns require non-word boundary on both sides so
+  // intraword underscores (snake_case identifiers, file_name, etc.)
+  // survive — matching CommonMark's intraword-underscore rule. The
+  // asterisk forms don't need the boundary check; asterisks never
+  // appear intraword in legitimate prose.
   out = out.replace(/\*\*\*([^*]+)\*\*\*/g, "$1");
   out = out.replace(/\*\*([^*]+)\*\*/g, "$1");
   out = out.replace(/\*([^*\n]+)\*/g, "$1");
-  out = out.replace(/__([^_]+)__/g, "$1");
-  out = out.replace(/_([^_\n]+)_/g, "$1");
+  out = out.replace(/(?<=^|\W)__([^_]+)__(?=\W|$)/g, "$1");
+  out = out.replace(/(?<=^|\W)_([^_\n]+)_(?=\W|$)/g, "$1");
 
   // Stray asterisks that didn't form a pair. Underscores are NOT
   // stripped here: bare underscores in plain prose are almost always
