@@ -626,19 +626,28 @@ Voice mode actions:
 Provider actions:
 - list: list available TTS providers with active marker and one-line summaries
 - describe: dump the full CAPABILITIES.md for one provider — pass providerName
-- switch: swap the active TTS provider — pass providerName`,
+- switch: swap the active TTS provider — pass providerName
+- ab: speak the same text through providerA then providerB back-to-back for direct comparison — pass providerName (= A), providerB, and text`,
     args: {
       action: tool.schema
         .enum([
           "on", "off", "status",
           "tagged", "tagged-raw", "all",
-          "list", "describe", "switch",
+          "list", "describe", "switch", "ab",
         ])
         .describe("Voice mode or provider action to perform."),
       providerName: tool.schema
         .string()
         .optional()
-        .describe("Provider name for describe/switch actions (e.g. 'qwen3-tts', 'higgs-audio-v3')."),
+        .describe("Provider name for describe/switch (single provider) or A side of ab (e.g. 'qwen3-tts')."),
+      providerB: tool.schema
+        .string()
+        .optional()
+        .describe("B side of ab action (e.g. 'higgs-audio-v3')."),
+      text: tool.schema
+        .string()
+        .optional()
+        .describe("Text to speak through both providers for the ab action. Use the same text for a fair comparison."),
     },
     async execute(args) {
       const action = args.action;
@@ -683,6 +692,61 @@ Provider actions:
         const previous = registry.getActiveName();
         registry.setActive(args.providerName as ProviderName);
         return `Active TTS provider: ${previous} → ${registry.getActiveName()}.`;
+      }
+
+      if (action === "ab") {
+        if (!args.providerName || !args.providerB || !args.text) {
+          throw new Error(
+            "The 'ab' action requires providerName (A), providerB, and text.",
+          );
+        }
+        const providerA = args.providerName as ProviderName;
+        const providerB = args.providerB as ProviderName;
+        const text = args.text;
+
+        // Capture the active provider so we can restore it after the
+        // comparison. The user's mental model is that ab is a one-off
+        // operation that doesn't permanently change which voice they
+        // get for normal speak calls.
+        const originalActive = registry.getActiveName();
+
+        // Side A
+        registry.setActive(providerA);
+        try {
+          const handleA = await playbackQueue.speak(
+            { text, volume: config.volume, speed: config.speed },
+            "replace",
+          );
+          await handleA.done;
+        } catch (err) {
+          registry.setActive(originalActive);
+          throw new Error(
+            `A/B comparison failed during side A (${providerA}): ${(err as Error).message}`,
+          );
+        }
+
+        // Brief pause between the two utterances so the comparison
+        // doesn't run together. The playback queue plays sequentially
+        // already; this is an explicit silence-gap for the listener.
+        await new Promise((resolve) => setTimeout(resolve, 800));
+
+        // Side B
+        registry.setActive(providerB);
+        try {
+          const handleB = await playbackQueue.speak(
+            { text, volume: config.volume, speed: config.speed },
+            "replace",
+          );
+          await handleB.done;
+        } catch (err) {
+          registry.setActive(originalActive);
+          throw new Error(
+            `A/B comparison failed during side B (${providerB}): ${(err as Error).message}`,
+          );
+        }
+
+        registry.setActive(originalActive);
+        return `A/B complete: ${providerA} → ${providerB}. Active provider restored to ${originalActive}.`;
       }
 
       if (!statePath) {
