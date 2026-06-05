@@ -255,7 +255,21 @@ function extractAllModeText(text: string): { cleanText: string; spokenText: stri
  * is normalized.
  */
 function normalizeForSpeech(text: string): string {
-  let out = text;
+  // Protect Higgs-style inline control tags (`<|category:value|>`) from
+  // every markdown / whitespace transform below. These tags carry
+  // underscores in values like `long_pause` and `speed_very_slow`; the
+  // generic underscore-stripping below would mangle them into
+  // unrecognized tags that the server then speaks as text.
+  //
+  // Strategy: extract the tags, replace with NUL-prefixed placeholders
+  // the normalizer is guaranteed not to touch, then restore at the end.
+  // Same shape works for any future SSML-style passthrough tags.
+  const protectedTags: string[] = [];
+  let out = text.replace(/<\|[^|]+\|>/g, (match) => {
+    const idx = protectedTags.length;
+    protectedTags.push(match);
+    return `\u0000HTAG${idx}\u0000`;
+  });
 
   // Fenced code blocks: drop entirely. Inline code: keep the word, drop backticks.
   out = out.replace(/```[\s\S]*?```/g, " ");
@@ -300,6 +314,11 @@ function normalizeForSpeech(text: string): string {
     .map((para) => para.replace(/\s+/g, " ").trim())
     .filter((para) => para.length > 0)
     .join("\n\n");
+
+  // Restore protected inline control tags.
+  out = out.replace(/\u0000HTAG(\d+)\u0000/g, (_, idx) => {
+    return protectedTags[Number(idx)] ?? "";
+  });
 
   return out;
 }
