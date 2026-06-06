@@ -232,16 +232,28 @@ function writeJsonFile(filePath: string, value: unknown): void {
  * remove the tags from the displayed text. Everything outside <no-speak>
  * tags is spoken as one logical utterance (default mode "replace": a new
  * turn cancels and replaces any in-flight playback from a prior turn).
+ *
+ * Paragraph breaks (\n\n+) are preserved as structural markers so the
+ * downstream chunker can split on them. Collapsing \s{2,} to a single
+ * space here would defeat the chunker's paragraph-split before it ran,
+ * sending the entire turn to the TTS provider as one ~2k+ char chunk —
+ * which both bloats per-request audio generation time and degrades
+ * playback when the next turn supersedes a still-playing long chunk.
  */
 function extractAllModeText(text: string): { cleanText: string; spokenText: string } {
-  const spokenText = text
-    .replace(/<no-speak>[\s\S]*?<\/no-speak>/gi, " ")
-    .replace(/\s{2,}/g, " ")
-    .trim();
+  // Strip <no-speak> blocks first.
+  let spoken = text.replace(/<no-speak>[\s\S]*?<\/no-speak>/gi, "\n\n");
+
+  // Preserve paragraph breaks; collapse other whitespace runs per paragraph.
+  spoken = spoken
+    .split(/\n{2,}/)
+    .map((para) => para.replace(/\s+/g, " ").trim())
+    .filter((para) => para.length > 0)
+    .join("\n\n");
 
   const cleanText = text.replace(/<\/?no-speak>/gi, "");
 
-  return { cleanText, spokenText };
+  return { cleanText, spokenText: spoken };
 }
 
 /**
